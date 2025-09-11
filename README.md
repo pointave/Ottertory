@@ -25,6 +25,7 @@ The shortcut to toggle record is **Alt+Z**.
    git clone https://github.com/pointave/Ottertory
    cd Ottertory
    pip install -r requirements.txt
+   pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu126
    ```
 
 ---
