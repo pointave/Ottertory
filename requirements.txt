@@ -1,0 +1,15 @@
+flet
+torch
+numpy
+sounddevice
+sentencepiece
+moshi
+soundfile
+triton-windows
+pyperclip
+keyboard
+requests
+ollama
+lmstudio
+kokoro
+tkinter
