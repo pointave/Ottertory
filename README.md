@@ -48,12 +48,13 @@ TIP :  Win+Ctrl+V   will pop up Windows quick audio device selector
 
 ---
 
-## Voices (Optional Kokoro Integration)
+## Kokoro
+This will download all the models, but you may need Espeak NG in your Environment Variables.
+PHONEMIZER_ESPEAK_LIBRARY  C:\Program Files\eSpeak NG\libespeak-ng.dll
+PHONEMIZER_ESPEAK_PATH   C:\Program Files\eSpeak NG\
+There's probably an export comamnd but you can add it manually.
+GLHF
 
-If you want to use **Kokoro voices** (from [Antistentorian](https://github.com/pointave/Antistentorian)):
-
-1. Copy the **Voices** folder from your Antistentorian installation into the Ottertory root directory.
-2. Place the **kokoro model** file and its `config.json` in the **Ottertory root folder**.
 
 ---
 
