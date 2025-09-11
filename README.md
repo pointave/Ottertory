@@ -41,7 +41,9 @@ If you want to record system audio in addition to microphone input:
    * Set playback to your normal output device (e.g., headphones, TV, or speakers)
 4. Keep your microphone as the **default recording device**.
 
-This routes system audio into Ottertory while preserving your microphone input.
+This routes system audio into Ottertory while preserving your microphone input. Changing default audio device will change your volume knob though...
+
+TIP :  Win+Ctrl+V   will pop up Windows quick audio device selector 
 
 ---
 
@@ -64,6 +66,4 @@ If you want to use **Kokoro voices** (from [Antistentorian](https://github.com/p
 ## 📜 License
 
 [MIT](LICENSE)
-
-```
 
