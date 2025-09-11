@@ -67,7 +67,3 @@ If you want to use **Kokoro voices** (from [Antistentorian](https://github.com/p
 
 ```
 
----
-
-Do you also want me to add **screenshots / GIF placeholders** in the README (with Markdown image tags), so users immediately see the GUI and caption box in action?
-```
