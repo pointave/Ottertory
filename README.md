@@ -1,7 +1,7 @@
 # Ottertory  
 
 Ottertory provides a **GUI** for handling transcription outputs with a **pop-out live caption box** (adjustable opacity).  
-It can output transcriptions in real time from your **microphone** (default recording device) and to **VB-Cable Output** (virtual audio output device). 
+It can output transcriptions in real time from your **microphone** (default recording device) or from **VB-Cable Output** (virtual audio output device). 
 
 Outputs can be copied, Kokoro TTS can read it out loud, Ollama/LMstudio can summarize or perform any custom command on the text (eg. translate). Recording usually goes in the live transcription box but you can change it to type in the Ollama Custom Command box. 
 
