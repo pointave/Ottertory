@@ -12,4 +12,4 @@ requests
 ollama
 lmstudio
 kokoro
-tkinter
+#tkinter  #captions worked without it
