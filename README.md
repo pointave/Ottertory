@@ -49,9 +49,13 @@ TIP :  Win+Ctrl+V   will pop up Windows quick audio device selector
 ---
 
 ## Kokoro
+---
 This will download all the models, but you may need Espeak NG in your Environment Variables.
+
 PHONEMIZER_ESPEAK_LIBRARY  C:\Program Files\eSpeak NG\libespeak-ng.dll
+
 PHONEMIZER_ESPEAK_PATH   C:\Program Files\eSpeak NG\
+
 There's probably an export comamnd but you can add it manually.
 GLHF
 
