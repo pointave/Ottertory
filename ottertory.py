@@ -162,200 +162,8 @@ audio_source_is_microphone = True  # True = microphone, False = system audio
 # TTS control event to allow stopping playback
 tts_stop_event = threading.Event()
 
-# Closed captioning overlay
-class ClosedCaptionOverlay:
-    def __init__(self):
-        self.root = None
-        self.label = None
-        self.text_buffer = ""
-        self.max_chars = 60  # Maximum characters before clearing
-        self.is_visible = False
-        self.overlay_thread = None
-        self.text_lock = threading.Lock()
-        self.clear_timer = None
-        self.current_font = ("Arial", 14, "bold")  # Default font settings
-        
-    def _on_mouse_wheel(self, event):
-        """Adjust window opacity based on mouse wheel movement"""
-        current_alpha = float(self.root.attributes('-alpha'))
-        if event.delta > 0:  # Scrolling up
-            new_alpha = min(1.0, current_alpha + 0.05)
-        else:  # Scrolling down
-            new_alpha = max(0.05, current_alpha - 0.05)  # Minimum 30% opacity for readability
-        self.root.attributes('-alpha', new_alpha)
-        
-    def _run_tkinter(self):
-        """Run the tkinter main loop in a separate thread"""
-        self.root = tk.Tk()
-        self.root.withdraw()  # Start hidden
-        self.root.title("Closed Captions")
-        self.root.configure(bg='black')
-        self.root.attributes('-topmost', True)  # Always on top
-        self.root.attributes('-alpha', 0.7)  # Slightly transparent
-        self.root.overrideredirect(True)  # Remove window decorations
-        
-        # Bind mouse wheel events to adjust opacity
-        self.root.bind('<MouseWheel>', self._on_mouse_wheel)
-
-        # Set a fixed width for the overlay (40% of screen width)
-        screen_width = self.root.winfo_screenwidth()
-        screen_height = self.root.winfo_screenheight()
-        self.overlay_width = min(600, int(screen_width * 0.3))  # 
-        self.overlay_height = min(80, int(screen_height * 0.001))  # Reduced height significantly
-
-        # Calculate font size based on screen height (smaller size)
-        self.set_font_size(max(16, int(screen_height * 0.02)))
-        
-        # Create a frame to hold the label for better centering
-        self.frame = tk.Frame(self.root, bg='black')
-        self.frame.pack(expand=True, fill='both')
-        
-        self.label = tk.Label(
-            self.frame,
-            text="",
-            font=self.current_font,
-            fg='white',
-            bg='black',
-            wraplength=self.overlay_width - 0,  # Reduced padding
-            justify='center',
-            padx=10,  # Reduced padding
-            pady=5,   # Reduced padding
-            bd=0,
-            highlightthickness=0  # Remove highlight border
-        )
-        self.label.pack(expand=True, fill='both')
-        
-        # Make window draggable
-        self.root.bind('<Button-1>', self.start_drag)
-        self.root.bind('<B1-Motion>', self.drag_window)
-        
-        # Position the window at the bottom center (8% of screen height)
-        overlay_height = int(screen_height * 0.00001)
-        x_pos = (screen_width - self.overlay_width) // 2
-        y_pos = screen_height - overlay_height - 20
-        self.root.geometry(f"{self.overlay_width}x{overlay_height}+{x_pos}+{y_pos}")
-        
-        # Start the main loop
-        self.root.mainloop()
-    
-    def create_overlay(self):
-        """Create the always-on-top overlay window"""
-        if self.root is not None:
-            print("Overlay already exists")
-            return
-            
-        print("Starting tkinter in a separate thread...")
-        self.overlay_thread = threading.Thread(target=self._run_tkinter, daemon=True)
-        self.overlay_thread.start()
-        
-        # Wait for tkinter to initialize
-        time.sleep(0.5)
-        print("Overlay window created")
-    
-    def start_drag(self, event):
-        """Start dragging the window"""
-        self.drag_start_x = event.x
-        self.drag_start_y = event.y
-        
-    def drag_window(self, event):
-        """Drag the window"""
-        x = self.root.winfo_x() + event.x - self.drag_start_x
-        y = self.root.winfo_y() + event.y - self.drag_start_y
-        self.root.geometry(f"+{x}+{y}")
-    
-    def show(self):
-        """Show the overlay window"""
-        def _show():
-            if self.root is not None:
-                screen_width = self.root.winfo_screenwidth()
-                screen_height = self.root.winfo_screenheight()
-                overlay_height = int(screen_height * 0.06)  # 8% of screen height
-                x_pos = (screen_width - self.overlay_width) // 2
-                y_pos = screen_height - overlay_height - 20
-                
-                self.root.geometry(f"{self.overlay_width}x{overlay_height}+{x_pos}+{y_pos}")
-                self.root.deiconify()
-                self.root.lift()
-                self.root.focus_force()
-                self.is_visible = True
-                print("Overlay window shown")
-            else:
-                print("Overlay window not initialized")
-        
-        if self.root is None:
-            self.create_overlay()
-            # Give it a moment to initialize
-            time.sleep(0.5)
-        
-        if self.root is not None:
-            self.root.after(0, _show)
-    
-    def hide(self):
-        """Hide the overlay window"""
-        if self.root is not None:
-            self.root.withdraw()
-            self.is_visible = False
-    
-    def set_font_size(self, size):
-        """Update the font size"""
-        if not isinstance(size, (int, float)) or size <= 0:
-            return
-            
-        self.current_font = ("Arial", int(size), "bold")
-        if self.label:
-            self.label.config(font=self.current_font)
-    
-    def update_text(self, new_text, is_live_transcription=False):
-        """Update the displayed text"""
-        if not self.is_visible or self.label is None or not new_text.strip():
-            return
-            
-        with self.text_lock:
-            if is_live_transcription:
-                # For live transcription, replace the buffer with new text
-                self.text_buffer = new_text[-self.max_chars:]  # Enforce max_chars
-                
-                # Keep only the last 2 sentences for cleaner display
-                if any(punc in self.text_buffer for punc in '.!?'):
-                    last_punc = max(self.text_buffer.rfind('.'), 
-                                  self.text_buffer.rfind('!'), 
-                                  self.text_buffer.rfind('?'))
-                    if last_punc > 0:
-                        # Keep everything after the last sentence end
-                        self.text_buffer = self.text_buffer[last_punc + 1:].strip()
-            else:
-                # For command mode, just show the full command (up to max_chars)
-                self.text_buffer = new_text[-self.max_chars:]
-            
-            # Update display in main thread
-            if self.root is not None:
-                self.root.after(0, self._update_display)
-    
-    def _update_display(self):
-        """Update the display (called from main thread)"""
-        if self.label is not None:
-            self.label.config(text=self.text_buffer)
-    
-    def clear_text(self):
-        """Clear the displayed text"""
-        with self.text_lock:
-            self.text_buffer = ""
-            if self.root is not None:
-                self.root.after(0, self._clear_display)
-    
-    def _clear_display(self):
-        """Clear the display (called from main thread)"""
-        if self.label is not None:
-            self.label.config(text="")
-    
-    def destroy(self):
-        """Destroy the overlay window"""
-        if self.root is not None:
-            self.root.quit()
-            self.root.destroy()
-            self.root = None
-            self.label = None
-            self.is_visible = False
+# Import ClosedCaptionOverlay from the new module
+from caption_overlay import ClosedCaptionOverlay
 
 # Function to toggle between microphone and system audio
 def toggle_audio_source():
@@ -1039,7 +847,6 @@ def main(page: ft.Page):
     # Microphone status UI
     mic_status = ft.Text("Mic: Idle")
     level_bar = ft.ProgressBar(value=0, width=200)
-    device_label = ft.Text(f"Model device: {device_str} (cuda_available={cuda_available})")
 
     # >>> Insert Ollama and TTS controls here
     ollama_models = get_llm_models()
@@ -1049,7 +856,18 @@ def main(page: ft.Page):
         default_ollama = last_ollama_model
     else:
         default_ollama = ollama_models[0] if ollama_models else None
-    ollama_dropdown = ft.Dropdown(label="LLM Model", options=ollama_opts, value=default_ollama)
+    def _on_model_changed(e):
+        """Save the selected model when changed"""
+        if e.control.value:
+            save_last_used_ollama_model(e.control.value)
+            print(f"Saved model selection: {e.control.value}")
+    
+    ollama_dropdown = ft.Dropdown(
+        label="LLM Model", 
+        options=ollama_opts, 
+        value=default_ollama,
+        on_change=_on_model_changed
+    )
     summarize_button = ft.ElevatedButton("Summarize", on_click=lambda e: threading.Thread(target=summarize_text_ui, args=(ollama_dropdown.value, result_text, page), daemon=True).start())
     bullets_button = ft.ElevatedButton("Bullet Points", on_click=lambda e: threading.Thread(target=run_bullet_points_ui, args=(ollama_dropdown.value, result_text, page), daemon=True).start())
     proof_button = ft.ElevatedButton("Proofread", on_click=lambda e: threading.Thread(target=run_proofread_ui, args=(ollama_dropdown.value, result_text, page), daemon=True).start())
@@ -1083,7 +901,7 @@ def main(page: ft.Page):
             overlay_toggle.bgcolor = None
             # Hide overlay immediately when disabled
             overlay.hide()
-            overlay.clear_text()
+            overlay.clear_text_only()
             print("Overlay disabled")
         page.update()
     # Auto-TTS toggle button and state
@@ -1328,7 +1146,7 @@ def main(page: ft.Page):
         # Only show overlay when starting recording if overlay is enabled
         if overlay_enabled:
             overlay.show()
-            overlay.clear_text()
+            overlay.clear_text_only()
         # If overlay is disabled, make sure it stays hidden
         elif not overlay_enabled:
             overlay.hide()
@@ -1366,7 +1184,7 @@ def main(page: ft.Page):
         # Only hide overlay when recording stops if overlay is disabled
         # If overlay is enabled, keep it visible but clear text
         if overlay_enabled:
-            overlay.clear_text()  # Keep overlay visible but clear text
+            overlay.clear_text_only()  # Keep overlay visible but clear text
         else:
             overlay.hide()  # Hide overlay if disabled
         
@@ -1498,7 +1316,6 @@ def main(page: ft.Page):
                     mic_status, 
                     level_bar
                 ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                device_label,
                 # LLM model selection and actions
                 ft.Row([ollama_dropdown, summarize_button, bullets_button, proof_button, refresh_button]),
                 # Command input area (above transcription)
