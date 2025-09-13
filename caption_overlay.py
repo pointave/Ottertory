@@ -3,6 +3,7 @@ import threading
 import time
 import collections  # For deque
 import tkinter.font as tkFont  # To measure font size
+import re
 
 class ClosedCaptionOverlay:
     def __init__(self):
@@ -25,6 +26,53 @@ class ClosedCaptionOverlay:
         # Time before the overlay is completely hidden after silence
         self.hide_timeout_seconds = 2.0
         self.silence_check_interval_ms = 100  # More responsive checking
+        
+        # Character correction map for fixing encoding issues
+        self.character_corrections = {
+            # Spanish
+            'Ã±': 'ñ',
+            # Russian
+            'Ð¶': 'ж',
+            'Ñ\x86': 'ц',
+            'Ñ\x8d': 'э',
+            'Ñ\x85': 'х',
+            'Ñ„': 'ф',
+            'Ð°': 'а',
+            'Ð±': 'б',
+            'Ð²': 'в',
+            'Ð³': 'г',
+            'Ð´': 'д',
+            'Ðµ': 'е',
+            'Ð·': 'з',
+            'Ð¸': 'и',
+            'Ð¹': 'й',
+            'Ðº': 'к',
+            'Ð»': 'л',
+            'Ð¼': 'м',
+            'Ð½': 'н',
+            'Ð¾': 'о',
+            'Ð¿': 'п',
+            'Ñ\x80': 'р',
+            'Ñ\x81': 'с',
+            'Ñ\x82': 'т',
+            'Ñ\x83': 'у',
+            'Ñ\x84': 'ф',
+            'Ñ\x85': 'х',
+            'Ñ\x86': 'ц',
+            'Ñ\x87': 'ч',
+            'Ñ\x88': 'ш',
+            'Ñ\x89': 'щ',
+            'Ñ\x8a': 'ъ',
+            'Ñ\x8b': 'ы',
+            'Ñ\x8c': 'ь',
+            'Ñ\x8d': 'э',
+            'Ñ\x8e': 'ю',
+            'Ñ\x8f': 'я',
+            'Ð•': 'Е',
+            'Ð¡': 'С',
+            'Ð£': 'У',
+            'Ð¯': 'Я'
+        }
 
     def _on_mouse_wheel(self, event):
         """Adjust window opacity based on mouse wheel movement"""
@@ -154,14 +202,68 @@ class ClosedCaptionOverlay:
         if self.root:
             self.root.after(self.silence_check_interval_ms, self._check_for_silence)
 
+    def _fix_character_encoding(self, text):
+        """Fix common encoding issues in the text, including raw byte sequences."""
+        if not text:
+            return text
+
+        # First, try to fix raw byte sequences like <0xD0><0xAD>
+        def process_byte_sequences(text):
+            # Handle sequences like <0xD0><0xAD> or <0xd0><0xad>
+            def replace_hex_sequence(match):
+                try:
+                    # Extract all hex values from the match
+                    hex_values = re.findall(r'<0x([0-9A-Fa-f]{2})>', match.group(0))
+                    if not hex_values:
+                        return match.group(0)
+                        
+                    # Convert hex strings to bytes
+                    byte_data = bytes(int(h, 16) for h in hex_values)
+                    
+                    # Try to decode as UTF-8 first, then fall back to cp1251 for Russian
+                    try:
+                        return byte_data.decode('utf-8')
+                    except UnicodeDecodeError:
+                        return byte_data.decode('cp1251')
+                        
+                except Exception as e:
+                    print(f"Error decoding sequence {match.group(0)}: {e}")
+                    return match.group(0)
+            
+            # Replace all occurrences of hex sequences
+            return re.sub(r'(?:<0x[0-9A-Fa-f]{2}>)+', replace_hex_sequence, text)
+        
+        # Process byte sequences first
+        text = process_byte_sequences(text)
+        
+        # Then fix any remaining common encoding issues
+        for wrong, right in self.character_corrections.items():
+            text = text.replace(wrong, right)
+            
+        # Clean up any remaining artifacts
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
+
     def update_text(self, new_full_fragment, is_live_transcription=False):
         with self.text_lock:
-            processed_fragment = new_full_fragment.strip()
+            # First fix encoding of the raw input
+            processed_fragment = self._fix_character_encoding(new_full_fragment.strip())
 
             if not any(char.isalnum() for char in processed_fragment):
                 return
 
-            candidate_lines = self._wrap_text_into_logical_lines(processed_fragment)
+            # Split into words and process each word's encoding
+            words = processed_fragment.split()
+            processed_words = [self._fix_character_encoding(word) for word in words]
+            
+            # Rebuild the text with fixed words
+            processed_text = ' '.join(processed_words)
+            
+            # Process the final text again to catch any multi-word patterns
+            processed_text = self._fix_character_encoding(processed_text)
+            
+            # Generate lines from the fully processed text
+            candidate_lines = self._wrap_text_into_logical_lines(processed_text)
             if not candidate_lines: 
                 return
 
