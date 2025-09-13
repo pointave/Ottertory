@@ -1,15 +1,14 @@
 # Ottertory  
 
 Ottertory provides a **GUI** for handling transcription outputs with a **pop-out live caption box** (adjustable opacity).  
-It can output transcriptions in real time from your **microphone** (default recording device) or from **VB-Cable Output** (virtual audio output device). 
+It can output transcriptions in real time from your **microphone** (default recording device) or from **VB-Cable Output** (virtual audio output device).
 
 Outputs can be copied, Kokoro TTS can read it out loud, Ollama/LMstudio can summarize or perform any custom command on the text (eg. translate). Recording usually goes in the live transcription box but you can change it to type in the Ollama Custom Command box. 
 
-The shortcut to toggle record is **Alt+Z**. 
+The shortcut to toggle record is **Alt+Z**. Highly recommend having "system volume sounds" at like 10% in Windows volume mixer. Depending on program you'll switch between holding z first and tapping alt or the reverse. 
 
 > For best accuracy, I still recommend my other app [Antistentorian](https://github.com/pointave/Antistentorian), which uses **Whisper** or **Parakeet**.  
-> However, the **Kyutai Moshi** model is very responsive and accurate but uses 4gb of VRAM (trained only on French and English). 
-
+> However, the **Kyutai Moshi** model is very responsive and accurate but uses 4gb of VRAM. It works surprisingly well with a ton of languages; French, Portugese, Spanish, Russian, German, Arabic.... others pop up but cant verify.  Similar to how VibeVoice (probably coming soon) said there model was trained for two languages but ends up handeling dozens of them. For chinese you'll need to fix the caption box to show the bottom line, gets some of the characters and might be worth it but I have no idea.
 ---
 
 ## Installation  
