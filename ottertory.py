@@ -586,7 +586,7 @@ def translate_segment(text, target_language, ollama_model):
         return ""
 
 
-def translation_worker(ollama_model, target_language, text_field, page):
+def translation_worker(ollama_model, target_language, text_field, page, overlay_enabled):
     """Background worker to process translation queue"""
     global auto_translate_active, last_translated_segment
     
@@ -612,8 +612,9 @@ def translation_worker(ollama_model, target_language, text_field, page):
                 if len(translations) > 5:  # Keep last 5 translations for context
                     translations = translations[-5:]
                 
-                # Update overlay with the latest translation
-                overlay.update_text(translated, is_live_transcription=False)
+                # Update overlay with the latest translation if enabled
+                if overlay_enabled:
+                    overlay.update_text(translated, is_live_transcription=False)
                 
                 # Update the text field with translations on the same line
                 if text_field:
@@ -1301,19 +1302,21 @@ def main(page: ft.Page):
                 if translate_worker_thread is None or not translate_worker_thread.is_alive():
                     translate_worker_thread = threading.Thread(
                         target=translation_worker,
-                        args=(ollama_dropdown.value, target_language, text_field, page),
+                        args=(ollama_dropdown.value, target_language, text_field, page, overlay_enabled),
                         daemon=True
                     )
                     translate_worker_thread.start()
                 
-                # Clear any previous translation from the overlay and result field
-                overlay.update_text("Translating...", is_live_transcription=False)
+                # Clear any previous translation from the overlay (if enabled) and result field
+                if overlay_enabled:
+                    overlay.update_text("Translating...", is_live_transcription=False)
                 text_field.value = ""  # Clear the result field
                 page.update()
                 print(f"Auto-translate ENABLED for {target_language}")
             else:
-                # Clear the overlay when turning off auto-translate
-                overlay.update_text("", is_live_transcription=False)
+                # Clear the overlay (if enabled) when turning off auto-translate
+                if overlay_enabled:
+                    overlay.update_text("", is_live_transcription=False)
                 # Restore the original transcription if available
                 if buffer.strip():
                     text_field.value = textwrap.fill(buffer.strip(), width=80)
