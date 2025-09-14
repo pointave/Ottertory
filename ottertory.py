@@ -177,6 +177,13 @@ def toggle_audio_source():
 # Global overlay instance
 overlay = ClosedCaptionOverlay()
 
+# Auto-translate state
+auto_translate_active = False
+translation_queue = queue.Queue()
+last_translated_segment = ""
+translate_worker_thread = None
+sentence_endings = ('.', '!', '?', '。', '？', '！')  # Include various language punctuation
+
 
 def audio_stream_thread(run_id: int):
     global audio_source_is_microphone
@@ -279,12 +286,51 @@ def transcriber_loop(result_field: ft.TextField, page: ft.Page, run_id: int, tex
     elif not show_overlay and overlay.is_visible:
         overlay.hide()
 
+        # For tracking sentences for translation
+    sentence_buffer = ""
+    
     def update_ui(current_text):
-        nonlocal last_update_time, buffer
+        nonlocal last_update_time, buffer, sentence_buffer
         current_time = time.time()
         
         # Always update the buffer with the latest text
         buffer = current_text
+        
+        # Check for complete sentences for translation
+        if auto_translate_active and current_text:
+            # Extract new text since last sentence
+            new_text = current_text[len(sentence_buffer):].strip()
+            
+            if new_text:
+                # Check if we have a complete sentence or segment
+                has_sentence_ending = any(ending in new_text for ending in sentence_endings)
+                segment_length = len(new_text)
+                
+                # Translate if we have a sentence ending or reached ~70 chars
+                if has_sentence_ending or segment_length >= 70:
+                    # Find the last sentence or take the whole segment
+                    if has_sentence_ending:
+                        # Find the last sentence ending
+                        last_ending_pos = -1
+                        for ending in sentence_endings:
+                            pos = new_text.rfind(ending)
+                            if pos > last_ending_pos:
+                                last_ending_pos = pos
+                        
+                        if last_ending_pos > -1:
+                            segment_to_translate = new_text[:last_ending_pos + 1].strip()
+                            sentence_buffer = current_text[:len(sentence_buffer) + last_ending_pos + 1]
+                        else:
+                            segment_to_translate = new_text.strip()
+                            sentence_buffer = current_text
+                    else:
+                        # Take the last ~70 chars as a segment
+                        segment_to_translate = new_text[-70:].strip()
+                        sentence_buffer = current_text
+                    
+                    # Queue for translation
+                    if segment_to_translate:
+                        translation_queue.put(segment_to_translate)
         
         # Update the UI if enough time has passed or if we detect the end of a sentence
         should_update = (
@@ -299,10 +345,18 @@ def transcriber_loop(result_field: ft.TextField, page: ft.Page, run_id: int, tex
                 if show_overlay:
                     overlay.update_text(buffer.strip(), is_live_transcription=False)
             else:
-                result_field.value = textwrap.fill(buffer.strip(), width=80)
-                page.update()
+                # Only update the result field if auto-translate is not active
+                if not auto_translate_active:
+                    result_field.value = textwrap.fill(buffer.strip(), width=80)
+                    page.update()
+                
+                # Always update the overlay if shown, but mark as translation when auto-translate is active
                 if show_overlay:
-                    overlay.update_text(buffer.strip(), is_live_transcription=True)
+                    if auto_translate_active:
+                        # Don't update the overlay with live text when translating
+                        pass
+                    else:
+                        overlay.update_text(buffer.strip(), is_live_transcription=True)
             
             last_update_time = current_time
             return True
@@ -486,6 +540,119 @@ def call_llm_custom_command(selected, text, command):
             return response['message']['content']
         except Exception as e:
             raise RuntimeError(f"Ollama API error: {e}")
+
+
+def translate_segment(text, target_language, ollama_model):
+    """Translate a segment of text using Ollama"""
+    if not text or not text.strip():
+        return ""
+    
+    try:
+        # Create a concise translation prompt
+        prompt = f"Translate to {target_language}: {text}"
+        
+        # Call the LLM for translation
+        if ollama_model.startswith('lmstudio::'):
+            model = ollama_model[len('lmstudio::'):]
+            url = 'http://localhost:1234/v1/chat/completions'
+            headers = {'Content-Type': 'application/json'}
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": f"You are a translator. Translate text to {target_language}. Only output the translation, nothing else."},
+                    {"role": "user", "content": text}
+                ],
+                "temperature": 0.3,
+                "max_tokens": 100
+            }
+            r = requests.post(url, json=payload, headers=headers, timeout=5)
+            r.raise_for_status()
+            data = r.json()
+            return data['choices'][0]['message']['content'].strip()
+        else:
+            # Ollama
+            from ollama import chat
+            response = chat(
+                model=ollama_model,
+                messages=[
+                    {"role": "system", "content": f"You are a translator. Translate text to {target_language}. Only output the translation, nothing else."},
+                    {"role": "user", "content": text}
+                ],
+                options={"temperature": 0.3}
+            )
+            return response['message']['content'].strip()
+    except Exception as e:
+        print(f"Translation error: {e}")
+        return ""
+
+
+def translation_worker(ollama_model, target_language, text_field, page):
+    """Background worker to process translation queue"""
+    global auto_translate_active, last_translated_segment
+    
+    # Store translations in a list to maintain context
+    translations = []
+    
+    while auto_translate_active:
+        try:
+            # Get text from queue with timeout
+            text = translation_queue.get(timeout=0.5)
+            
+            if not text or not auto_translate_active:
+                continue
+                
+            # Translate the segment
+            translated = translate_segment(text, target_language, ollama_model)
+            
+            if translated and auto_translate_active:
+                # Add to our translations list
+                translations.append(translated)
+                
+                # Keep only the last few translations to avoid memory issues
+                if len(translations) > 5:  # Keep last 5 translations for context
+                    translations = translations[-5:]
+                
+                # Update overlay with the latest translation
+                overlay.update_text(translated, is_live_transcription=False)
+                
+                # Update the text field with translations on the same line
+                if text_field:
+                    # Get the latest translation
+                    latest_translation = translations[-1] if translations else ""
+                    
+                    # Get existing text without the last translation if it exists
+                    existing_text = text_field.value or ""
+                    
+                    # Split by double newlines to separate translations
+                    existing_translations = [t.strip() for t in existing_text.split('\n\n') if t.strip()]
+                    
+                    # Keep only the last 4 translations to avoid clutter
+                    if len(existing_translations) >= 4:
+                        existing_translations = existing_translations[-4:]
+                    
+                    # Add the latest translation if it's new
+                    if latest_translation and latest_translation not in existing_text:
+                        existing_translations.append(latest_translation)
+                    
+                    # Update the text field with all translations on one line
+                    if existing_translations:
+                        text_field.value = ' '.join(existing_translations)
+                        page.update()
+                
+                last_translated_segment = translated
+                print(f"Translated: '{text[:30]}...' -> '{translated[:30]}...'")
+                
+        except queue.Empty:
+            continue
+        except Exception as e:
+            print(f"Translation worker error: {e}")
+            # Try to update the UI with error message
+            try:
+                if text_field:
+                    text_field.value = f"Translation error: {str(e)}"
+                    page.update()
+            except Exception as update_error:
+                print(f"Failed to update UI: {update_error}")
 
 
 def clear_ollama_memory(selected):
@@ -817,6 +984,10 @@ def copy_text_ui(result_field: ft.TextField):
 def main(page: ft.Page):
     page.title = " Ottertory "
     page.scroll = ft.ScrollMode.AUTO
+    
+    # Make page available to other functions
+    global page_ref
+    page_ref = page
     result_text = ft.TextField(
         label="Live Transcription", multiline=True, min_lines=8, expand=True
     )
@@ -1092,6 +1263,124 @@ def main(page: ft.Page):
         ).start()
     )
     copy_button = ft.ElevatedButton("Copy Text", on_click=lambda e: copy_text_ui(result_text))
+    
+    # Translation controls
+    translate_button = ft.ElevatedButton(
+        "Translate",
+        tooltip="Translate the text using the selected language",
+        on_click=lambda e: threading.Thread(target=translate_text, args=(result_text, language_dropdown.value), daemon=True).start()
+    )
+    
+    language_dropdown = ft.Dropdown(
+        label="Language",
+        options=[
+            ft.dropdown.Option("Russian"),
+            ft.dropdown.Option("Spanish"),
+            ft.dropdown.Option("French"),
+            ft.dropdown.Option("German"),
+            ft.dropdown.Option("English"),
+            ft.dropdown.Option("Arabic"),
+            ft.dropdown.Option("Chinese"),
+            ft.dropdown.Option("Japanese")
+        ],
+        value="French",
+        width=120
+    )
+    
+    def translate_text(text_field, target_language):
+        """Translate the text in the result field to the target language using Ollama.
+        If recording is active, toggles auto-translate mode. Otherwise does a one-time translation."""
+        global auto_translate_active, translate_worker_thread
+        
+        # If recording, toggle auto-translate mode
+        if recording_flag.is_set():
+            auto_translate_active = not auto_translate_active
+            
+            if auto_translate_active:
+                # Start translation worker if not already running
+                if translate_worker_thread is None or not translate_worker_thread.is_alive():
+                    translate_worker_thread = threading.Thread(
+                        target=translation_worker,
+                        args=(ollama_dropdown.value, target_language, text_field, page),
+                        daemon=True
+                    )
+                    translate_worker_thread.start()
+                
+                # Clear any previous translation from the overlay and result field
+                overlay.update_text("Translating...", is_live_transcription=False)
+                text_field.value = ""  # Clear the result field
+                page.update()
+                print(f"Auto-translate ENABLED for {target_language}")
+            else:
+                # Clear the overlay when turning off auto-translate
+                overlay.update_text("", is_live_transcription=False)
+                # Restore the original transcription if available
+                if buffer.strip():
+                    text_field.value = textwrap.fill(buffer.strip(), width=80)
+                    page.update()
+                print("Auto-translate DISABLED")
+            
+            # Update button appearance
+            translate_button.text = f"{'Stop ' if auto_translate_active else ''}Translate"
+            translate_button.bgcolor = ft.Colors.GREEN_400 if auto_translate_active else None
+            page.update()
+            return
+        
+        # If not recording, do a one-time translation
+        if not text_field.value.strip():
+            print("No text to translate")
+            return
+            
+        try:
+            # Save original text and show loading state
+            original_text = text_field.value
+            text_field.disabled = True
+            text_field.value = f"Translating to {target_language}..."
+            page.update()
+            
+            # Call the LLM for translation
+            if model_dropdown.value.startswith('lmstudio::'):
+                model = model_dropdown.value[len('lmstudio::'):]
+                url = 'http://localhost:1234/v1/chat/completions'
+                headers = {'Content-Type': 'application/json'}
+                payload = {
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": f"You are a translator. Translate text to {target_language}. Only output the translation, nothing else."},
+                        {"role": "user", "content": original_text}
+                    ],
+                    "temperature": 0.3,
+                    "max_tokens": 2000
+                }
+                r = requests.post(url, json=payload, headers=headers, timeout=30)
+                r.raise_for_status()
+                data = r.json()
+                translated = data['choices'][0]['message']['content'].strip()
+            else:
+                # Ollama
+                from ollama import chat
+                response = chat(
+                    model=model_dropdown.value,
+                    messages=[
+                        {"role": "system", "content": f"You are a translator. Translate text to {target_language}. Only output the translation, nothing else."},
+                        {"role": "user", "content": original_text}
+                    ],
+                    options={"temperature": 0.3}
+                )
+                translated = response['message']['content'].strip()
+            
+            # Update the text field with the translation
+            text_field.value = translated
+            text_field.disabled = False
+            page.update()
+            
+        except Exception as e:
+            print(f"Translation error: {e}")
+            text_field.value = original_text
+            text_field.disabled = False
+            page.update()
+            
+        return
 
     start_button = ft.ElevatedButton("Start", disabled=False)
     stop_button = ft.ElevatedButton("Stop", disabled=True)
@@ -1175,6 +1464,21 @@ def main(page: ft.Page):
         except Exception:
             pass
 
+        # Clean up translation worker if active
+        global auto_translate_active, translate_worker_thread
+        if auto_translate_active:
+            auto_translate_active = False
+            print("Auto-translate disabled due to recording stop")
+            
+            # Reset translate button state
+            translate_button.text = "Translate"
+            translate_button.bgcolor = None
+            page.update()
+        
+        # Clear translation queue
+        with translation_queue.mutex:
+            translation_queue.queue.clear()
+        
         # Exit streaming context so LMGen is not left open
         try:
             state.stop_streaming()
@@ -1296,33 +1600,61 @@ def main(page: ft.Page):
     page.add(
         ft.Column(
             [
-                ft.Text("Ottertory", size=18),
-                # TTS Controls at the top (with icon buttons first)
+                # Title
+                ft.Text("Ottertory", size=18, weight=ft.FontWeight.BOLD),
+                
+                # Recording controls - Row 1
+                ft.Row([
+                    start_button, 
+                    stop_button,
+                    audio_source_toggle,
+                    overlay_toggle,
+                    mic_status,
+                    level_bar
+                ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                
+                # TTS Controls - Row 2
                 ft.Row([
                     play_tts_button,
                     stop_tts_button,
                     voice_dropdown,
                     speed_slider,
+                    auto_tts_toggle,
                     download_tts_button,
                     copy_button,
-                    auto_tts_toggle
                 ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                # Recording controls
+                
+                # Translation and LLM Controls - Row 3
                 ft.Row([
-                    start_button, 
-                    stop_button, 
-                    audio_source_toggle, 
-                    overlay_toggle, 
-                    mic_status, 
-                    level_bar
-                ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                # LLM model selection and actions
-                ft.Row([ollama_dropdown, summarize_button, bullets_button, proof_button, refresh_button]),
-                # Command input area (above transcription)
-                ft.Row([text_dest_toggle, command_field, run_command_button, clear_command_button]),
-                # Transcription area
-                result_text,
-            ]
+                    # Translation controls
+                    translate_button,
+                    language_dropdown,
+                    # LLM controls
+                    ft.Container(width=10),  # Spacer
+                    ollama_dropdown,
+                    refresh_button,
+                    summarize_button,
+                    bullets_button,
+                    proof_button,
+                ], spacing=5, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                
+                # Command input area - Row 4
+                ft.Row([
+                    text_dest_toggle,
+                    command_field,
+                    run_command_button,
+                    clear_command_button
+                ], spacing=5, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                
+                # Transcription area - Takes remaining space
+                ft.Container(
+                    content=result_text,
+                    expand=True,
+                    margin=ft.margin.only(top=10)
+                ),
+            ],
+            spacing=10,
+            expand=True,
         )
     )
 
@@ -1339,6 +1671,16 @@ def main(page: ft.Page):
         if recording_flag.is_set():
             recording_flag.clear()
             print("Stopped active recording")
+        
+        # Clean up translation resources
+        global auto_translate_active, translate_worker_thread, translation_queue
+        if auto_translate_active:
+            auto_translate_active = False
+            print("Stopped auto-translation")
+        
+        # Clear translation queue
+        with translation_queue.mutex:
+            translation_queue.queue.clear()
         
         # Cleanup overlay
         try:
