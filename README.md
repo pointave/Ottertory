@@ -46,10 +46,23 @@ This routes system audio into Ottertory while preserving your microphone input. 
 TIP :  Win+Ctrl+V   will pop up Windows quick audio device selector 
 
 ---
+## Openai-TTS Endpoint
+---
+Will expand use way later, but I use https://github.com/diodiogod/TTS-Audio-Suite, specifically there is an option on the tools page called "OpenAI TTS API" and I have the auto enable checked. You are going to want to install that extension, the chatterbox, and probably even the kokoro extension to be safe. HOPEFULLY thats all you need, just have it running at the same time and it will receive requests, but I've only tested on my device.
 
+***YOU NEED TO CHANGE .env.example to .env*** 
+
+Chatterbox uses like 6gb of vram but is EXTREMELY fast now, like a 10x improvement than a month or two ago. To use the multilingual model you'll have to select the ID checkbox. This pulls the language id tag and the other chatterbox model. I dont know if I should just stick with only multimodel and default to English language id tag instead of using the original model as the English TTS so if you want to test that and report back that'd be helpful, because its kind of a drag swapping the models, but I havent checked how the API endpoint behaves with other models like xttsv2 or w/e yet. 
+
+If you enable auto-tts and have the ID checked it will show both the spoken language and the translation. I recommend using a small model like a Gemma3:2b/Qwen3:1.6/LLama3.2:2b to have everything on at once and as fast as possible.   
+
+
+There are bugs like not being able to download any tts output for chatterbox, crashing when pushing stop and quickly pushing play or record, ...
+
+---
 ## Kokoro
 ---
-This will download all the models, but you may need Espeak NG in your Environment Variables.
+This will download all the models, but you may need Espeak NG in your Environment Variables.  ( MOST LIKELY Unnecessary)
 
 PHONEMIZER_ESPEAK_LIBRARY  C:\Program Files\eSpeak NG\libespeak-ng.dll
 
@@ -67,6 +80,11 @@ GLHF
 * [x] Real-time transcription to microphone + VB-Cable Output
 
 ---
+
+### CREDITS 
+Kokoro
+Chatterbox
+Kyutai
 
 ## 📜 License
 
