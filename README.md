@@ -45,7 +45,7 @@ If you want to record system audio in addition to microphone input:
 ---
 ## Openai-TTS Endpoint
 
-Will expand use way later, but I use https://github.com/diodiogod/TTS-Audio-Suite, specifically there is an option on the tools page called "OpenAI TTS API" and I have the auto enable checked. You are going to want to install that extension, the chatterbox, and probably even the kokoro extension to be safe. HOPEFULLY thats all you need, just have it running at the same time and it will receive requests, but I've only tested on my device.
+Will expand use way later, but I use https://github.com/rsxdalv/TTS-WebUI, specifically there is an option on the tools page called "OpenAI TTS API" and I have the auto enable checked. You are going to want to install that extension, the chatterbox, and probably even the kokoro extension to be safe. HOPEFULLY thats all you need, just have it running at the same time and it will receive requests, but I've only tested on my device.
 
 ***YOU NEED TO CHANGE .env.example to .env*** 
 
