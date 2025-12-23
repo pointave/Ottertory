@@ -29,7 +29,7 @@ LANGUAGE_CODES = {
     "Turkish": "tr"
 }
 
-from dotenv import load_dotenv, set_key, dotenv_values
+from dotenv import load_dotenv
 import flet as ft
 import torch
 import sounddevice as sd
@@ -40,19 +40,148 @@ from moshi.models import loaders, LMGen, MimiModel, LMModel
 import sentencepiece
 import queue
 import time
-import textwrap
 import re
 import requests
 import pyperclip
 import keyboard
-import tkinter as tk
-from tkinter import ttk
 from models import build_model, generate_speech, list_available_voices
 from openai import OpenAI
 import json
 import tempfile
 import shutil
 from pathlib import Path
+import math
+
+# Utility constants and functions
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def split_sentences(text):
+    """Split text into sentences using regex pattern."""
+    return [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if s.strip()]
+
+def create_voice_drop_handler(voice_drop_text, page):
+    """Create a reusable voice drop handler."""
+    def handle_drop(e: ft.DragTargetEvent):
+        if e.data and 'files' in e.data:
+            files = e.data['files']
+            if files:
+                file_path = files[0]['path']
+                if file_path.lower().endswith(('.wav', '.mp3', '.ogg', '.flac')):
+                    success, result = update_voice_path(file_path)
+                    if success:
+                        voice_drop_text.value = f"Voice: {result}"
+                        voice_drop_text.color = ft.Colors.GREEN
+                    else:
+                        voice_drop_text.value = f"Error: {result}"
+                        voice_drop_text.color = ft.Colors.RED
+                    page.update()
+                    return
+        voice_drop_text.value = "CLONE"
+        voice_drop_text.color = None
+        page.update()
+    return handle_drop
+
+def get_voice_display_name():
+    """Get the current voice display name from the stored file."""
+    try:
+        voice_file = os.path.join(SCRIPT_DIR, 'voices', 'current_voice.txt')
+        if os.path.exists(voice_file):
+            with open(voice_file, 'r') as f:
+                return f.read().strip()
+    except Exception:
+        pass
+    return "Not set"
+
+
+class WaveformVisualizer:
+    def __init__(self, width=400, height=80):
+        self.width = width
+        self.height = height
+        self.amplitude = 0.0
+        self.phase = 0.0
+        self.target_amplitude = 0.0
+        self.bars = []
+        
+    def create_control(self):
+        """Create the flet control for the waveform visualizer using bars"""
+        # Create multiple vertical bars to simulate waveform
+        num_bars = 20
+        self.bars = []
+        
+        for i in range(num_bars):
+            bar = ft.Container(
+                width=self.width // num_bars - 2,
+                height=1,  # Start with minimal height
+                bgcolor=ft.Colors.CYAN_400,
+                border_radius=2,
+            )
+            self.bars.append(bar)
+        
+        return ft.Container(
+            content=ft.Row(
+                self.bars,
+                spacing=1,
+                alignment=ft.MainAxisAlignment.CENTER,
+                vertical_alignment=ft.CrossAxisAlignment.END
+            ),
+            width=self.width,
+            height=self.height,
+            bgcolor=ft.Colors.with_opacity(0.1, ft.Colors.BLUE_GREY_900),
+            border_radius=10,
+            padding=5,
+        )
+    
+    def set_level(self, level):
+        """Set the audio level (0.0 to 1.0)"""
+        self.target_amplitude = level
+    
+    def update_wave(self):
+        """Update waveform animation using bar heights"""
+        if not self.bars:
+            return
+            
+        # Smooth amplitude transition
+        self.amplitude += (self.target_amplitude - self.amplitude) * 0.3
+        self.phase += 0.15  # Animation speed
+        
+        # Update bar heights to create waveform effect
+        num_bars = len(self.bars)
+        for i, bar in enumerate(self.bars):
+            # Create wave pattern using sine function
+            wave_offset = math.sin((i / num_bars) * math.pi * 2 + self.phase)
+            wave_amplitude = self.amplitude * (self.height - 10)  # Leave some padding
+            
+            # Calculate bar height based on wave and amplitude
+            # Check if we're recording and have sufficient audio
+            is_recording_with_audio = recording_flag.is_set() and self.amplitude > 0.01
+            
+            if is_recording_with_audio:  # Show animated waveform during recording with audio
+                bar_height = max(1, int(abs(wave_offset) * wave_amplitude))
+                # Add some variation between bars
+                if i % 2 == 0:
+                    bar_height = int(bar_height * 0.7)
+            else:  # Show flat line when not recording or very low amplitude
+                bar_height = 1  # Minimal height for flat line
+            
+            bar.height = bar_height
+            
+            # Update color based on amplitude and recording state
+            if is_recording_with_audio:
+                if self.amplitude > 0.5:
+                    bar.bgcolor = ft.Colors.CYAN_400
+                elif self.amplitude > 0.2:
+                    bar.bgcolor = ft.Colors.BLUE_400
+                else:
+                    bar.bgcolor = ft.Colors.BLUE_GREY_400
+            else:  # Not recording or very low amplitude
+                bar.bgcolor = ft.Colors.BLUE_GREY_600
+        
+        # Update all bars
+        for bar in self.bars:
+            try:
+                bar.update()
+            except Exception:
+                pass
 
 
 @dataclass
@@ -193,7 +322,18 @@ audio_level_lock = threading.Lock()
 audio_source_is_microphone = True  # True = microphone, False = system audio
 
 # TTS control event to allow stopping playback
+# We set the event initially to indicate "not playing". Playback routines call
+# tts_stop_event.clear() when starting and stop_tts_ui() sets the event.
 tts_stop_event = threading.Event()
+tts_stop_event.set()
+
+# Playback guard to prevent overlapping TTS sessions which can hang audio device
+tts_playback_lock = threading.Lock()
+tts_playback_active = False
+
+# Registry of active TTS worker threads so stop_tts_ui can join them
+tts_threads_lock = threading.Lock()
+current_tts_threads = []
 
 # Import ClosedCaptionOverlay from the new module
 from caption_overlay import ClosedCaptionOverlay
@@ -209,6 +349,7 @@ def toggle_audio_source():
 
 # Global overlay instance
 overlay = ClosedCaptionOverlay()
+
 
 # Language dropdown (global)
 language_dropdown = None
@@ -406,7 +547,7 @@ def transcriber_loop(result_field: ft.TextField, page: ft.Page, run_id: int, tex
             else:
                 # Only update the result field if auto-translate is not active
                 if not auto_translate_active:
-                    result_field.value = textwrap.fill(buffer.strip(), width=80)
+                    result_field.value = buffer.strip()
                     page.update()
                 
                 # Always update the overlay if shown, but mark as translation when auto-translate is active
@@ -528,18 +669,47 @@ def load_kokoro_model(device_str="cpu"):
     return kokoro_model
 
 
+def get_llama_cpp_port():
+    """Get the llama.cpp port from config file or return default."""
+    config_file = os.path.join(os.path.expanduser("~"), ".antistentorian_llamacpp_port.txt")
+    try:
+        if os.path.exists(config_file):
+            with open(config_file, 'r') as f:
+                port = f.read().strip()
+                if port.isdigit():
+                    return int(port)
+    except Exception:
+        pass
+    return 8081  # Default port for llama.cpp
+
+
+def set_llama_cpp_port(port):
+    """Set the llama.cpp port in config file."""
+    config_file = os.path.join(os.path.expanduser("~"), ".antistentorian_llamacpp_port.txt")
+    try:
+        with open(config_file, 'w') as f:
+            f.write(str(port))
+        print(f"llama.cpp port set to {port}")
+        return True
+    except Exception as e:
+        print(f"Error setting llama.cpp port: {e}")
+        return False
+
+
 def get_llm_models():
-    """Return list of available LLM models from both Ollama and LM Studio.
+    """Return list of available LLM models from Ollama, LM Studio, and llama.cpp.
     
     Returns:
-        list: List of model names with 'lmstudio::' prefix for LM Studio models
+        list: List of model names with prefixes:
+              - 'lmstudio::' for LM Studio models
+              - 'llamacpp::' for llama.cpp models
     """
     models = []
     
     # Get Ollama models
     ollama_models = []
     try:
-        resp = requests.get('http://localhost:11434/api/tags', timeout=3)
+        resp = requests.get('http://localhost:11434/api/tags', timeout=0.5)
         if resp.status_code == 200:
             data = resp.json()
             if 'models' in data:
@@ -550,7 +720,7 @@ def get_llm_models():
     # Get LM Studio models
     lmstudio_models = []
     try:
-        resp = requests.get('http://localhost:1234/v1/models', timeout=3)
+        resp = requests.get('http://localhost:1234/v1/models', timeout=0.5)
         if resp.status_code == 200:
             data = resp.json()
             if 'data' in data:
@@ -563,12 +733,29 @@ def get_llm_models():
     except Exception as e:
         print(f"Warning: Could not fetch LM Studio models: {e}")
     
-    # Combine models with LM Studio models at the bottom
-    models = ollama_models + lmstudio_models
+    # Get llama.cpp models
+    llamacpp_models = []
+    llamacpp_port = get_llama_cpp_port()
+    try:
+        resp = requests.get(f'http://localhost:{llamacpp_port}/v1/models', timeout=0.5)
+        if resp.status_code == 200:
+            data = resp.json()
+            if 'data' in data:
+                # Deduplicate models by ID, keeping the first occurrence
+                seen = set()
+                for model in data['data']:
+                    if 'id' in model and model['id'] not in seen:
+                        seen.add(model['id'])
+                        llamacpp_models.append(f"llamacpp::{model['id']}")
+    except Exception as e:
+        print(f"Warning: Could not fetch llama.cpp models on port {llamacpp_port}: {e}")
+    
+    # Combine models with custom providers at the bottom
+    models = ollama_models + lmstudio_models + llamacpp_models
     
     # If no models found, provide a default
-    if not models and not ollama_models and not lmstudio_models:
-        models = ['gemma3:4b-it-qat']  # Default fallback
+    if not models and not ollama_models and not lmstudio_models and not llamacpp_models:
+        models = ['granite4:micro-h']  # Default fallback
     
     return models
 
@@ -598,12 +785,28 @@ def load_last_used_ollama_model():
 
 
 def call_llm_custom_command(selected, text, command):
-    """Call LM Studio (prefixed) or Ollama to run a simple instruction on text."""
+    """Call LM Studio, llama.cpp (prefixed) or Ollama to run a simple instruction on text."""
     if not selected:
         raise RuntimeError("No LLM model selected")
     if selected.startswith('lmstudio::'):
         model = selected[len('lmstudio::'):]
         url = 'http://localhost:1234/v1/chat/completions'
+        headers = {'Content-Type': 'application/json'}
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant. Respond in plain text."},
+                {"role": "user", "content": f"Process the following text as per the instruction below.\n\nText:\n{text}\n\nInstruction:\n{command}"}
+            ]
+        }
+        r = requests.post(url, json=payload, headers=headers, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        return data['choices'][0]['message']['content']
+    elif selected.startswith('llamacpp::'):
+        model = selected[len('llamacpp::'):]
+        port = get_llama_cpp_port()
+        url = f'http://localhost:{port}/v1/chat/completions'
         headers = {'Content-Type': 'application/json'}
         payload = {
             "model": model,
@@ -633,7 +836,7 @@ def call_llm_custom_command(selected, text, command):
 
 
 def translate_segment(text, target_language, ollama_model):
-    """Translate a segment of text using Ollama"""
+    """Translate a segment of text using Ollama, LM Studio, or llama.cpp"""
     if not text or not text.strip():
         return ""
     
@@ -649,7 +852,25 @@ def translate_segment(text, target_language, ollama_model):
             payload = {
                 "model": model,
                 "messages": [
-                    {"role": "system", "content": f"You are a translator. Translate text to {target_language}. Only output the translation, nothing else."},
+                    {"role": "system", "content": f"You are a translator. Translate text to {target_language}. Only output the translation, and its VERY IMPORTANT if you receive a blank text output a dash (-)!!!! Like 'Veuillez fournir le texte à traduire' is not acceptable output, it should be -"},
+                    {"role": "user", "content": text}
+                ],
+                "temperature": 0.3,
+                "max_tokens": 100
+            }
+            r = requests.post(url, json=payload, headers=headers, timeout=5)
+            r.raise_for_status()
+            data = r.json()
+            return data['choices'][0]['message']['content'].strip()
+        elif ollama_model.startswith('llamacpp::'):
+            model = ollama_model[len('llamacpp::'):]
+            port = get_llama_cpp_port()
+            url = f'http://localhost:{port}/v1/chat/completions'
+            headers = {'Content-Type': 'application/json'}
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": f"You are a translator. Translate text to {target_language}. Only output the translation, and its VERY IMPORTANT if you receive a blank text output a dash (-)!!!! Like Veuillez fournir le texte à traduire' is not acceptable output, it should be -"},
                     {"role": "user", "content": text}
                 ],
                 "temperature": 0.3,
@@ -685,16 +906,63 @@ def translation_worker(ollama_model, target_language, text_field, page, overlay_
     
     while auto_translate_active:
         try:
-            # Get text from queue with timeout
-            text = translation_queue.get(timeout=0.5)
+            # Collect all available text from queue to combine segments
+            combined_text = ""
+            segment_count = 0
             
-            if not text or not auto_translate_active:
+            # Get first text with timeout
+            text = translation_queue.get(timeout=0.5)
+            if text and auto_translate_active:
+                combined_text = text
+                segment_count = 1
+            
+            # Collect additional queued segments immediately (non-blocking)
+            while auto_translate_active and segment_count < 5:  # Limit to 5 segments max
+                try:
+                    additional_text = translation_queue.get_nowait()
+                    if additional_text:
+                        combined_text += " " + additional_text
+                        segment_count += 1
+                except queue.Empty:
+                    break
+            
+            if not combined_text or not auto_translate_active:
                 continue
                 
-            # Translate the segment
-            translated = translate_segment(text, target_language, ollama_model)
+            # Translate the combined segment
+            translated = translate_segment(combined_text, target_language, ollama_model)
             
             if translated and auto_translate_active:
+                # Common default messages in different languages
+                default_messages = [
+                    'Veuillez fournir le texte à traduire',  # French
+                    'Please provide the text you would like me to translate',
+                    'Please provide the text',   # English
+                    'Necesito texto para traducir', 
+                    'Por favor, proporciona el texto que quieres que traduzca', # Spanish
+                    'Por favor, forneça o texto que você deseja que eu traduza',
+                    'Por favor, forneça o vídeo para que eu possa traduzi-lo para o português',
+                    'Bitte geben Sie den zu übersetzenden Text an',
+                    'Bitte gib mir den Text, den du übersetzt haben möchtest',  # German
+                    'Si prega di fornire il testo da tradurre',  # Italian
+                    'Proszę, podaj tekst do przetłumaczeni',
+                    'Пожалуйста, предоставьте текст для перевода',
+                    ' Есть ответственность для наций, способствующих геноциду, у тех, кто… сила и влияние говорить о своих правах',  # Russian
+                    'テキストを入力してください',  # Japanese
+                    '请提供要翻译的文本',  # Chinese Simplified
+                    '번역할 텍스트를 입력해 주세요'  # Korean
+                ]
+                
+                # Check if the translation is a default message or just a dash/empty
+                is_default_message = any(
+                    msg.lower() in translated.lower() 
+                    for msg in default_messages
+                )
+                
+                if is_default_message or translated.strip() == '-' or not translated.strip():
+                    # Use the original text instead of the translation
+                    translated = text
+                
                 # Add to our translations list
                 translations.append(translated)
                 
@@ -764,6 +1032,22 @@ def clear_ollama_memory(selected):
             }
             requests.post(url, json=payload, headers=headers, timeout=5)
             print("LM Studio memory cleared")
+        except Exception:
+            pass  # Ignore errors when clearing memory
+    elif selected.startswith('llamacpp::'):
+        # For llama.cpp, we can't directly clear memory, but we can send a reset message
+        model = selected[len('llamacpp::'):]
+        port = get_llama_cpp_port()
+        url = f'http://localhost:{port}/v1/chat/completions'
+        headers = {'Content-Type': 'application/json'}
+        try:
+            # Send a system message to reset the conversation
+            payload = {
+                "model": model,
+                "messages": [{"role": "system", "content": "Conversation history cleared."}]
+            }
+            requests.post(url, json=payload, headers=headers, timeout=5)
+            print("llama.cpp memory cleared")
         except Exception:
             pass  # Ignore errors when clearing memory
     else:
@@ -847,7 +1131,7 @@ def run_proofread_ui(selected_model, result_field, page):
         print("Proofread failed:", e)
 
 
-def play_tts_ui(voice_name, text, device_str, speed=1.0, page=None):
+def play_tts_ui(voice_name, text, device_str, speed=1.0, page=None, language_code=None):
     """Generate audio with either Kokoro or OpenAI TTS and play it.
     
     Args:
@@ -857,135 +1141,80 @@ def play_tts_ui(voice_name, text, device_str, speed=1.0, page=None):
         speed: Playback speed (0.25 - 4.0)
         page: Optional page reference for accessing UI state
     """
-    global use_openai_tts, kokoro_model
-    
+    global use_openai_tts, kokoro_model, tts_playback_active
+
     if not text.strip():
         print("No text to speak")
         return
-    
-    # For OpenAI TTS, we need to process language settings if ID tag is enabled
-    if use_openai_tts:
-        # Default to no language code (will use voice's default language)
-        language_code = None
-        multilingual_attr = False
-        
-        # Check if ID tag (multilingual mode) is enabled
-        if hasattr(page, 'multilingual_mode'):
-            multilingual_attr = page.multilingual_mode
-        elif hasattr(page, 'page') and hasattr(page.page, 'multilingual_mode'):
-            multilingual_attr = page.page.multilingual_mode
-        
-        print(f"ID Tag (Multilingual Mode): {'Enabled' if multilingual_attr else 'Disabled'}")
-        
-        # Only process language settings if ID tag is enabled
-        if multilingual_attr:
-            # Debug: Print page attributes
-            print("\n--- DEBUG: Page Attributes ---")
-            print(f"Page attributes: {dir(page)}")
-            if hasattr(page, 'page'):
-                print(f"Page.page attributes: {dir(page.page)}")
-            
-            # Get the selected language from the global dropdown
-            global language_dropdown
-            
-            # Debug info
-            print("\n--- DEBUG: Language Dropdown State ---")
-            print(f"Language dropdown exists: {language_dropdown is not None}")
-            if language_dropdown is not None:
-                print(f"Dropdown value: {getattr(language_dropdown, 'value', 'NO VALUE')}")
-                print(f"Dropdown options: {getattr(language_dropdown, 'options', 'NO OPTIONS')}")
-            
-            if not language_dropdown or not hasattr(language_dropdown, 'value'):
-                raise ValueError("Language dropdown not properly initialized")
-                
-            selected_language = language_dropdown.value
-            if not selected_language:
-                raise ValueError("No language selected in dropdown")
-            print(f"Selected language: {selected_language}")
-            language_name = None
-            
-            # Find matching language name
-            for name, code in LANGUAGE_CODES.items():
-                if name.lower() == selected_language.lower():
-                    language_name = name
-                    break
-            
-            # If no exact match, try partial match
-            if not language_name:
-                for name in LANGUAGE_CODES:
-                    if selected_language.lower() in name.lower():
-                        language_name = name
-                        break
-            
-            language_name = language_name or selected_language
-            language_code = LANGUAGE_CODES.get(language_name, 'en')
-            
-            print("\n--- OpenAI TTS Language Settings (ID Tag Enabled) ---")
-            print(f"Selected Language: {selected_language}")
-            print(f"Matched Language: {language_name}")
-            print(f"Language Code: {language_code}")
-        else:
-            print("\n--- OpenAI TTS Language Settings (ID Tag Disabled) ---")
-            print("Using voice's default language")
-        
-        # Resolve the voice path for OpenAI TTS
-        if not os.path.isabs(voice_name) and not voice_name.lower().endswith(('.wav', '.mp3', '.ogg')):
-            # This is a voice name, not a path - get the path from the environment
-            voice_path = os.getenv('tts_voice_path')
-            if voice_path and not os.path.isabs(voice_path):
-                # Make path absolute relative to the script directory
-                script_dir = os.path.dirname(os.path.abspath(__file__))
-                voice_path = os.path.join(script_dir, voice_path)
-            
-            # Use the configured voice path if it exists
-            if voice_path and os.path.exists(voice_path):
-                voice_to_use = voice_path
+
+    # Prevent overlapping playback sessions
+    with tts_playback_lock:
+        if tts_playback_active:
+            print("TTS play request ignored: playback already active")
+            return
+        tts_playback_active = True
+
+    try:
+        # For OpenAI TTS, process multilingual settings and resolve voice path
+        if use_openai_tts:
+            multilingual_attr = False
+            if language_code:
+                multilingual_attr = True
             else:
-                # Try to use the default voice file
-                script_dir = os.path.dirname(os.path.abspath(__file__))
-                default_voice = os.path.join(script_dir, 'voices', 'tempclone.wav')
-                if os.path.exists(default_voice):
-                    voice_to_use = default_voice
-                    print(f"Using default voice file: {default_voice}")
+                if hasattr(page, 'multilingual_mode'):
+                    multilingual_attr = page.multilingual_mode
+                elif hasattr(page, 'page') and hasattr(page.page, 'multilingual_mode'):
+                    multilingual_attr = page.page.multilingual_mode
+
+            if multilingual_attr:
+                # Resolve language code from dropdown if present
+                try:
+                    global language_dropdown
+                    selected_language = language_dropdown.value if language_dropdown and hasattr(language_dropdown, 'value') else None
+                    language_name = None
+                    if selected_language:
+                        for name in LANGUAGE_CODES:
+                            if name.lower() == selected_language.lower():
+                                language_name = name
+                                break
+                        if not language_name:
+                            for name in LANGUAGE_CODES:
+                                if selected_language.lower() in name.lower():
+                                    language_name = name
+                                    break
+                        language_name = language_name or selected_language
+                        language_code = LANGUAGE_CODES.get(language_name, language_code)
+                except Exception:
+                    pass
+
+            # Resolve voice path
+            if not os.path.isabs(voice_name) and not voice_name.lower().endswith(('.wav', '.mp3', '.ogg')):
+                voice_path = os.getenv('tts_voice_path')
+                if voice_path and not os.path.isabs(voice_path):
+                    script_dir = SCRIPT_DIR
+                    voice_path = os.path.join(script_dir, voice_path)
+                if voice_path and os.path.exists(voice_path):
+                    voice_to_use = voice_path
                 else:
-                    raise FileNotFoundError(
-                        f"OpenAI TTS requires a valid voice file. "
-                        f"Default voice file not found at: {default_voice}"
-                    )
+                    script_dir = SCRIPT_DIR
+                    default_voice = os.path.join(script_dir, 'voices', 'tempclone.wav')
+                    if os.path.exists(default_voice):
+                        voice_to_use = default_voice
+                    else:
+                        print("OpenAI TTS voice file not found; falling back to Kokoro")
+                        return _play_kokoro_tts(voice_name, text, 'cpu', speed)
+            else:
+                voice_to_use = voice_name
+
+            _play_openai_tts(voice_to_use, text, speed, language_code=language_code, multilingual=multilingual_attr)
         else:
-            # This is already a path or a special identifier
-            voice_to_use = voice_name
-            
-        print(f"\n--- OpenAI TTS Request ---")
-        print(f"Voice: {os.path.basename(voice_to_use) if os.path.exists(voice_to_use) else voice_to_use}")
-        print(f"Voice Path: {voice_to_use}")
-        print(f"Language Code: {language_code}")
-        print(f"Speed: {speed}")
-        print(f"Text Length: {len(text)} characters")
-        print("----------------------")
-        
-        _play_openai_tts(voice_to_use, text, speed, language_code=language_code, 
-                        multilingual=multilingual_attr if multilingual_attr is not None else False)
-    else:
-        # For Kokoro TTS, we don't need language settings
-        print("\n--- Kokoro TTS Request ---")
-        print(f"Voice: {voice_name}")
-        print(f"Speed: {speed}")
-        print(f"Text Length: {len(text)} characters")
-        print("----------------------")
-        
-        # Only load Kokoro TTS model when actually needed for playback
-        try:
-            # Only load Kokoro model, not STT models
+            # Kokoro path
             if kokoro_model is None:
-                print("Loading Kokoro TTS model...")
                 load_kokoro_model(device_str)
             _play_kokoro_tts(voice_name, text, device_str, speed)
-        except Exception as e:
-            print(f"Failed to load Kokoro TTS model: {e}")
-            # Re-raise the error to prevent falling back to OpenAI TTS
-            print(f"Kokoro TTS failed to load: {e}")
-            raise
+    finally:
+        with tts_playback_lock:
+            tts_playback_active = False
 
 def _play_openai_tts(voice_name, text, speed=1.0, language_code=None, multilingual=False):
     """Generate and stream audio using OpenAI TTS API with parallel processing.
@@ -1009,7 +1238,7 @@ def _play_openai_tts(voice_name, text, speed=1.0, language_code=None, multilingu
     
     # If path is not absolute, try to resolve it relative to the script directory
     if voice_path and not os.path.isabs(voice_path):
-        script_dir = os.path.dirname(os.path.abspath(__file__))
+        script_dir = SCRIPT_DIR
         # First try the path as is (could be relative to script dir)
         temp_path = os.path.join(script_dir, voice_path)
         if os.path.exists(temp_path):
@@ -1027,7 +1256,7 @@ def _play_openai_tts(voice_name, text, speed=1.0, language_code=None, multilingu
         print(f"Warning: Voice file not found at {voice_path}")
         # Try one last time with just the filename in the voices directory
         if voice_path:
-            last_try = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'voices', os.path.basename(voice_path))
+            last_try = os.path.join(SCRIPT_DIR, 'voices', os.path.basename(voice_path))
             if os.path.exists(last_try):
                 voice_path = last_try
                 print(f"Found voice file at: {voice_path}")
@@ -1039,6 +1268,11 @@ def _play_openai_tts(voice_name, text, speed=1.0, language_code=None, multilingu
     voice_id = voice_path
     
     print(f"Using OpenAI TTS with voice: {voice_id}")
+    # Debug: log the language code being used for download requests
+    try:
+        print(f"Download OpenAI TTS language_code: {language_code}")
+    except Exception:
+        print("Download OpenAI TTS language_code: <unavailable>")
     
     import queue
     import threading
@@ -1054,16 +1288,42 @@ def _play_openai_tts(voice_name, text, speed=1.0, language_code=None, multilingu
     generation_complete = threading.Event()
     stop_event = threading.Event()
     
-    # Prepare the request parameters
-    params = {
-        'model': os.getenv('tts_model', 'chatterbox'),  # Default to chatterbox model
-        'voice': voice_id,
-        'input': text,
-        'speed': min(max(0.5, speed), 1.5),  # Ensure speed is within valid range
-    }
+    # Prepare the request parameters using overlay configuration
+    overlay_config = overlay.get_tts_config() if overlay else None
+    if overlay_config and 'params' in overlay_config:
+        # Use overlay configuration as base template
+        params_template = overlay_config['params'].copy()
+        
+        # Use voice from overlay if provided, otherwise fall back to voice_id
+        overlay_voice = params_template.get('voice', '').strip()
+        voice_to_use = overlay_voice if overlay_voice else voice_id
+        
+        params = {
+            'model': params_template.get('model', 'chatterbox'),
+            'voice': voice_to_use,
+            'input': text,
+            'speed': min(max(0.5, params_template.get('speed', speed)), 1.5),
+        }
+        # Copy extra_body parameters if they exist
+        if 'extra_body' in params_template:
+            params['extra_body'] = params_template['extra_body'].copy()
+        print("Using TTS parameters from overlay configuration")
+        if overlay_voice:
+            print(f"Using custom voice from overlay: {overlay_voice}")
+        else:
+            print(f"Using default voice: {voice_id}")
+    else:
+        # Fallback to hardcoded parameters
+        params = {
+            'model': os.getenv('tts_model', 'chatterbox'),  # Default to chatterbox model
+            'voice': voice_id,
+            'input': text,
+            'speed': min(max(0.5, speed), 1.5),  # Ensure speed is within valid range
+        }
+        print("Using default TTS parameters (overlay not available)")
     
-    # Add language parameters for multilingual support
-    if language_code:
+    # Add language parameters for multilingual support (only if not already configured)
+    if language_code and 'extra_body' not in params:
         params['extra_body'] = {
             'params': {
                 'language_id': language_code,
@@ -1072,6 +1332,9 @@ def _play_openai_tts(voice_name, text, speed=1.0, language_code=None, multilingu
                 'multilingual': True
             }
         }
+    elif language_code and 'extra_body' in params and 'params' in params['extra_body']:
+        # Update language_id in existing configuration
+        params['extra_body']['params']['language_id'] = language_code
     
     print(f"Sending TTS request with params: {params}")
     
@@ -1116,28 +1379,53 @@ def _play_openai_tts(voice_name, text, speed=1.0, language_code=None, multilingu
         """Worker thread that generates audio chunks and adds them to the queue."""
         try:
             # Split text into sentences
-            sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if s.strip()]
+            sentences = split_sentences(text)
             if not sentences:
                 sentences = [text]
             
-            # Initialize client once at the start
+            # Get sentence concatenation setting from overlay
+            concat_count = 1  # Default to 1 sentence
+            if overlay and hasattr(overlay, 'tts_sentence_concat'):
+                concat_count = overlay.tts_sentence_concat
+                print(f"Using sentence concatenation: {concat_count}")
+            
+            # Group sentences for concatenation
+            sentence_groups = []
+            for i in range(0, len(sentences), concat_count):
+                group = sentences[i:i + concat_count]
+                sentence_groups.append(' '.join(group))
+            
+            print(f"Processing {len(sentences)} sentences in {len(sentence_groups)} groups")
+            
+            # Initialize client once at the start using overlay configuration
+            # Get TTS configuration from overlay
+            overlay_config = overlay.get_tts_config() if overlay else None
+            if overlay_config:
+                tts_host = overlay_config.get('host', '127.0.0.1')
+                tts_port = overlay_config.get('port', '7778')
+                base_url = f'http://{tts_host}:{tts_port}/v1'
+                print(f"Using TTS configuration from overlay: {base_url}")
+            else:
+                base_url = 'http://127.0.0.1:7778/v1'
+                print("Using default TTS configuration (overlay not available)")
+            
             client = OpenAI(
-                base_url='http://127.0.0.1:7778/v1',
+                base_url=base_url,
                 api_key='dummy_key'
             )
             
-            for sentence in sentences:
+            for group_idx, sentence_group in enumerate(sentence_groups):
                 if tts_stop_event.is_set() or stop_event.is_set():
                     break
                     
-                if not sentence.strip():
+                if not sentence_group.strip():
                     continue
                     
-                # Ensure sentence ends with punctuation
-                if not sentence.endswith(('.', '!', '?')):
-                    sentence += '.'
+                # Ensure group ends with punctuation
+                if not sentence_group.endswith(('.', '!', '?')):
+                    sentence_group += '.'
                     
-                print(f"TTS: generating sentence (chars={len(sentence)}): {sentence[:50]}...")
+                print(f"TTS: generating group {group_idx + 1}/{len(sentence_groups)} (chars={len(sentence_group)}): {sentence_group[:50]}...")
                 
                 # Try generation with retries
                 for attempt in range(3):
@@ -1149,16 +1437,44 @@ def _play_openai_tts(voice_name, text, speed=1.0, language_code=None, multilingu
                         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
                             temp_path = temp_file.name
                         
-                        # Prepare the request parameters for this sentence
-                        request_params = {
-                            'model': 'chatterbox',
-                            'voice': voice_path,
-                            'input': sentence,
-                            'speed': min(max(0.5, float(speed)), 1.5)
-                        }
+                        # Prepare the request parameters for this sentence using overlay configuration
+                        overlay_config = overlay.get_tts_config() if overlay else None
+                        if overlay_config and 'params' in overlay_config:
+                            # Use overlay configuration as base template
+                            params_template = overlay_config['params'].copy()
+                            
+                            # Use voice from overlay if provided, otherwise default to tempclone.wav
+                            overlay_voice = params_template.get('voice', '').strip()
+                            if overlay_voice:
+                                voice_to_use = overlay_voice
+                                print(f"Using custom voice from overlay: {overlay_voice}")
+                            else:
+                                voice_to_use = voice_path
+                                print(f"Using voice: {voice_path}")
+                            
+                            request_params = {
+                                'model': params_template.get('model', 'chatterbox'),
+                                'voice': voice_to_use,
+                                'input': sentence_group,
+                                'speed': min(max(0.5, params_template.get('speed', float(speed))), 1.5)
+                            }
+                            # Copy extra_body parameters if they exist
+                            if 'extra_body' in params_template:
+                                request_params['extra_body'] = params_template['extra_body'].copy()
+                            print("Using TTS request parameters from overlay configuration")
+                        else:
+                            # Fallback to hardcoded parameters
+                            request_params = {
+                                'model': 'chatterbox',
+                                'voice': voice_path,
+                                'input': sentence_group,
+                                'speed': min(max(0.5, float(speed)), 1.5)
+                            }
+                            print("Using default TTS request parameters (overlay not available)")
+                            print(f"Using voice: {voice_path}")
                         
-                        # Add multilingual parameters if needed
-                        if multilingual and language_code:
+                        # Add multilingual parameters if needed (only if not already configured)
+                        if multilingual and language_code and 'extra_body' not in request_params:
                             request_params['extra_body'] = {
                                 'params': {
                                     'language_id': language_code,
@@ -1167,16 +1483,19 @@ def _play_openai_tts(voice_name, text, speed=1.0, language_code=None, multilingu
                                     'multilingual': True
                                 }
                             }
-                            
-                            # Log the complete request parameters for debugging
-                            print("\n--- TTS Request Parameters ---")
+                        elif multilingual and language_code and 'extra_body' in request_params and 'params' in request_params['extra_body']:
+                            # Update language_id in existing configuration
+                            request_params['extra_body']['params']['language_id'] = language_code
+                        
+                        # Log the complete request parameters for debugging
+                        print("\n--- TTS Request Parameters ---")
+                        if multilingual:
                             print(f"Multilingual mode enabled")
                             print(f"Language code: {language_code}")
-                            print(f"Using model: {request_params['model']} with multilingual support")
-                            
-                            import json
-                            print("Complete request parameters:")
-                            print(json.dumps(request_params, indent=2, ensure_ascii=False))
+                        print(f"Using model: {request_params['model']}")
+                        import json
+                        print("Complete request parameters:")
+                        print(json.dumps(request_params, indent=2, ensure_ascii=False))
                         
                         # Make the API call for this sentence
                         with client.audio.speech.with_streaming_response.create(**request_params) as response:
@@ -1190,7 +1509,7 @@ def _play_openai_tts(voice_name, text, speed=1.0, language_code=None, multilingu
                     except Exception as e:
                         print(f"Error generating TTS (attempt {attempt + 1}/3): {e}")
                         if attempt == 2:  # If this was the last attempt
-                            print(f"Failed to generate audio for: {sentence}")
+                            print(f"Failed to generate audio for: {sentence_group}")
                         time.sleep(0.5)  # Wait before retry
                     
         except Exception as e:
@@ -1204,6 +1523,11 @@ def _play_openai_tts(voice_name, text, speed=1.0, language_code=None, multilingu
     audio_thread = threading.Thread(target=audio_worker, daemon=True)
     generator_thread = threading.Thread(target=generate_worker, daemon=True)
     
+    # Register threads so stop_tts_ui can join them
+    with tts_threads_lock:
+        current_tts_threads.append(audio_thread)
+        current_tts_threads.append(generator_thread)
+
     audio_thread.start()
     generator_thread.start()
     
@@ -1231,6 +1555,16 @@ def _play_openai_tts(voice_name, text, speed=1.0, language_code=None, multilingu
                     pass
             except queue.Empty:
                 break
+        # Ensure threads are removed from registry
+        with tts_threads_lock:
+            try:
+                current_tts_threads.remove(audio_thread)
+            except ValueError:
+                pass
+            try:
+                current_tts_threads.remove(generator_thread)
+            except ValueError:
+                pass
 
 def _play_kokoro_tts(voice_name, text, device_str, speed=1.0):
     """Generate and stream audio with Kokoro TTS, playing chunks as they're generated."""
@@ -1249,7 +1583,7 @@ def _play_kokoro_tts(voice_name, text, device_str, speed=1.0):
         return
 
     # Split into sentences while keeping punctuation
-    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', normalized_text) if s.strip()]
+    sentences = split_sentences(normalized_text)
     if not sentences:
         sentences = [normalized_text]
 
@@ -1352,7 +1686,11 @@ def _play_kokoro_tts(voice_name, text, device_str, speed=1.0):
     # Start audio playback and generation threads
     audio_thread = threading.Thread(target=audio_worker, daemon=True)
     generator_thread = threading.Thread(target=generate_worker, daemon=True)
-    
+    # Register threads so stop_tts_ui can join them
+    with tts_threads_lock:
+        current_tts_threads.append(audio_thread)
+        current_tts_threads.append(generator_thread)
+
     audio_thread.start()
     generator_thread.start()
     
@@ -1380,6 +1718,16 @@ def _play_kokoro_tts(voice_name, text, device_str, speed=1.0):
                     pass
             except queue.Empty:
                 break
+        # Remove threads from registry
+        with tts_threads_lock:
+            try:
+                current_tts_threads.remove(audio_thread)
+            except ValueError:
+                pass
+            try:
+                current_tts_threads.remove(generator_thread)
+            except ValueError:
+                pass
 
 def _download_kokoro_tts(voice_name, text, device_str, speed=1.0):
     """Generate and save audio using Kokoro TTS."""
@@ -1391,7 +1739,7 @@ def _download_kokoro_tts(voice_name, text, device_str, speed=1.0):
         return None
 
     # Split into sentences while keeping punctuation
-    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', normalized_text) if s.strip()]
+    sentences = split_sentences(normalized_text)
     if not sentences:
         sentences = [normalized_text]
 
@@ -1417,7 +1765,7 @@ def _download_kokoro_tts(voice_name, text, device_str, speed=1.0):
         if audio_tensor is None:
             # Fallback to sentence-level
             print(f"Chunk generation failed for download; falling back to sentences for chunk {idx+1}")
-            sub_sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', chunk) if s.strip()]
+            sub_sentences = split_sentences(chunk)
             for ss in sub_sentences:
                 if not ss.endswith(('.', '!', '?')):
                     ss += '.'
@@ -1447,7 +1795,7 @@ def _download_kokoro_tts(voice_name, text, device_str, speed=1.0):
         print("Error concatenating audio pieces:", e)
         return None
 
-def _download_openai_tts(voice_name, text, speed=1.0):
+def _download_openai_tts(voice_name, text, speed=1.0, language_code=None):
     """Generate and save audio using OpenAI TTS."""
     import os
     import tempfile
@@ -1466,14 +1814,14 @@ def _download_openai_tts(voice_name, text, speed=1.0):
         
     # Convert relative path to absolute path based on script location
     if not os.path.isabs(voice_path):
-        script_dir = os.path.dirname(os.path.abspath(__file__))
+        script_dir = SCRIPT_DIR
         voice_path = os.path.join(script_dir, voice_path)
         print(f"Resolved voice path to: {voice_path}")
         
     if not os.path.exists(voice_path):
         print(f"Error: Voice file not found at {voice_path}")
         # Try to find the voice file in the voices directory
-        voices_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'voices')
+        voices_dir = os.path.join(SCRIPT_DIR, 'voices')
         alt_path = os.path.join(voices_dir, 'tempclone.wav')
         if os.path.exists(alt_path):
             print(f"Found voice file at alternative location: {alt_path}")
@@ -1484,9 +1832,14 @@ def _download_openai_tts(voice_name, text, speed=1.0):
     
     # Convert full path to the format expected by the API
     try:
-        path_parts = os.path.normpath(voice_path).split(os.sep)
-        if len(path_parts) >= 3:
-            voice_id = f"voices/{path_parts[-3]}/{path_parts[-2]}/{path_parts[-1]}"
+        # Build voice id relative to the 'voices' directory so the server receives
+        # something like 'voices/tempclone.wav' instead of including local folders.
+        norm = os.path.normpath(voice_path)
+        parts = norm.split(os.sep)
+        if 'voices' in parts:
+            idx = parts.index('voices')
+            rel_parts = parts[idx:]
+            voice_id = '/'.join(rel_parts)
         else:
             voice_id = f"voices/{os.path.basename(voice_path)}"
     except Exception as e:
@@ -1496,21 +1849,68 @@ def _download_openai_tts(voice_name, text, speed=1.0):
     print(f"Using OpenAI TTS with voice: {voice_id}")
     
     try:
+        # Use overlay configuration if available, otherwise fall back to environment variables
+        overlay_config = overlay.get_tts_config() if overlay else None
+        if overlay_config:
+            tts_host = overlay_config.get('host', '127.0.0.1')
+            tts_port = overlay_config.get('port', '7778')
+            base_url = f'http://{tts_host}:{tts_port}/v1'
+            print(f"Using TTS configuration from overlay for download: {base_url}")
+        else:
+            # Allow using environment-configured OpenAI endpoint/key, but fall back to local chatterbox proxy
+            base_url = os.getenv('openai_base_url') or 'http://127.0.0.1:7778/v1'
+            print("Using default TTS configuration for download (overlay not available)")
+        
+        api_key = os.getenv('openai_api_key')
+
+        # If no API key provided and we're using a local proxy, use the dummy key used elsewhere in the app
+        if not api_key:
+            if base_url.startswith('http://127.0.0.1') or 'localhost' in base_url:
+                api_key = 'dummy_key'
+            else:
+                print("Warning: No OpenAI API key set; requests to remote OpenAI will fail with 401")
+
+        print(f"OpenAI download client base_url: {base_url}, api_key_set: {bool(api_key)}")
         client = OpenAI(
-            base_url=os.getenv('openai_base_url'),
-            api_key=os.getenv('openai_api_key')
+            base_url=base_url,
+            api_key=api_key
         )
         
-        # Prepare the request parameters
-        params = {
-            'model': os.getenv('tts_model', 'tts-1'),
-            'voice': voice_id,
-            'input': text,
-            'speed': speed,
-        }
+        # Prepare the request parameters using overlay configuration
+        if overlay_config and 'params' in overlay_config:
+            # Use overlay configuration as base template
+            params_template = overlay_config['params'].copy()
+            
+            # Use voice from overlay if provided, otherwise fall back to voice_path
+            overlay_voice = params_template.get('voice', '').strip()
+            voice_to_use = overlay_voice if overlay_voice else voice_path
+            
+            params = {
+                'model': params_template.get('model', 'tts-1'),
+                'voice': voice_to_use,
+                'input': text,
+                'speed': params_template.get('speed', speed),
+            }
+            # Copy extra_body parameters if they exist
+            if 'extra_body' in params_template:
+                params['extra_body'] = params_template['extra_body'].copy()
+            print("Using TTS parameters from overlay configuration for download")
+            if overlay_voice:
+                print(f"Using custom voice from overlay: {overlay_voice}")
+            else:
+                print(f"Using default voice: {voice_path}")
+        else:
+            # Fallback to hardcoded parameters
+            params = {
+                'model': os.getenv('tts_model', 'tts-1'),
+                'voice': voice_path,
+                'input': text,
+                'speed': speed,
+            }
+            print("Using default TTS parameters for download (overlay not available)")
         
         # Always include language parameters as they're required by chatterbox
-        if language_code:
+        if language_code and 'extra_body' not in params:
             params['extra_body'] = {
                 'params': {
                     'language_id': language_code,
@@ -1519,6 +1919,9 @@ def _download_openai_tts(voice_name, text, speed=1.0):
                     'multilingual': True  # Explicitly enable multilingual
                 }
             }
+        elif language_code and 'extra_body' in params and 'params' in params['extra_body']:
+            # Update language_id in existing configuration
+            params['extra_body']['params']['language_id'] = language_code
         
         print(f"Sending TTS request with params: {params}")
         
@@ -1566,7 +1969,33 @@ def download_tts_ui(voice_name, text, device_str, speed=1.0):
     
     # Use the appropriate TTS engine
     if use_openai_tts:
-        result = _download_openai_tts(voice_name, text, speed)
+        # Determine language_code similarly to play_tts_ui when multilingual ID tag is enabled
+        language_code = None
+        multilingual_attr = False
+        # Try to detect multilingual mode from the global language_dropdown or page attributes if available
+        try:
+            # If there's a global language_dropdown and it has a value, attempt to resolve it
+            global language_dropdown
+            if language_dropdown and hasattr(language_dropdown, 'value') and language_dropdown.value:
+                selected_language = language_dropdown.value
+                language_name = None
+                for name, code in LANGUAGE_CODES.items():
+                    if name.lower() == selected_language.lower():
+                        language_name = name
+                        break
+                if not language_name:
+                    for name in LANGUAGE_CODES:
+                        if selected_language.lower() in name.lower():
+                            language_name = name
+                            break
+                language_name = language_name or selected_language
+                language_code = LANGUAGE_CODES.get(language_name, 'en')
+                multilingual_attr = True
+                print(f"Download OpenAI TTS: using language {language_name} (code: {language_code})")
+        except Exception:
+            language_code = None
+
+        result = _download_openai_tts(voice_name, text, speed, language_code=language_code)
     else:
         result = _download_kokoro_tts(voice_name, text, device_str, speed)
     
@@ -1600,7 +2029,36 @@ def stop_tts_ui():
         _sd.stop()
     except Exception:
         pass
-    print("TTS stop signaled")
+
+    # Wait briefly for any active playback to finish cleaning up
+    start = time.time()
+    while True:
+        with tts_playback_lock:
+            active = tts_playback_active
+        if not active or (time.time() - start) > 1.0:
+            break
+        time.sleep(0.05)
+
+    if active:
+        print("TTS stop signaled; playback still active (timeout) — resources may still be cleaning up")
+    else:
+        print("TTS stop signaled")
+
+    # Additionally, join any active TTS threads to ensure they exit
+    try:
+        with tts_threads_lock:
+            threads = list(current_tts_threads)
+        for th in threads:
+            try:
+                if th is not None and th.is_alive():
+                    th.join(timeout=1.0)
+            except Exception:
+                pass
+        # Clear registry
+        with tts_threads_lock:
+            current_tts_threads.clear()
+    except Exception:
+        pass
 
 
 def copy_text_ui(result_field: ft.TextField):
@@ -1622,7 +2080,7 @@ def update_voice_path(file_path: str):
         print(f"Source file: {os.path.abspath(file_path)}")
         
         # Define the voices directory relative to the script location
-        script_dir = os.path.dirname(os.path.abspath(__file__))
+        script_dir = SCRIPT_DIR
         voices_dir = os.path.join(script_dir, 'voices')
         print(f"Voices directory: {voices_dir}")
         os.makedirs(voices_dir, exist_ok=True)
@@ -1720,7 +2178,7 @@ def update_voice_path(file_path: str):
             f.write(original_filename)
         
         # Update the environment variable to use relative path
-        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+        env_path = os.path.join(SCRIPT_DIR, '.env')
         normalized_path = 'voices/tempclone.wav'  # Always use this relative path
         
         # Update the .env file
@@ -1786,28 +2244,10 @@ def main(page: ft.Page):
     
     # Microphone status UI
     mic_status = ft.Text("Mic: Idle")
-    level_bar = ft.ProgressBar(value=0, width=200)
+    waveform_viz = WaveformVisualizer(width=400, height=40)
+    waveform_control = waveform_viz.create_control()
 
     # Voice file drop target
-    def handle_drop(e: ft.DragTargetEvent):
-        if e.data and 'files' in e.data:
-            files = e.data['files']
-            if files:
-                file_path = files[0]['path']
-                if file_path.lower().endswith(('.wav', '.mp3', '.ogg', '.flac')):
-                    success, result = update_voice_path(file_path)
-                    if success:
-                        voice_drop_text.value = f"Voice: {result}"  # result is already the original filename
-                        voice_drop_text.color = ft.Colors.GREEN
-                    else:
-                        voice_drop_text.value = f"Error: {result}"
-                        voice_drop_text.color = ft.Colors.RED
-                    page.update()
-                    return
-        voice_drop_text.value = "CLONE"
-        voice_drop_text.color = None
-        page.update()
-
     voice_drop = ft.Container(
         content=ft.Column([
             ft.Icon(ft.Icons.UPLOAD_FILE, size=40, color=ft.Colors.BLUE_400),
@@ -1830,23 +2270,15 @@ def main(page: ft.Page):
         data=None,
     )
 
-    # Function to get the current voice display name
-    def get_voice_display_name():
-        try:
-            voice_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'voices', 'current_voice.txt')
-            if os.path.exists(voice_file):
-                with open(voice_file, 'r') as f:
-                    return f.read().strip()
-        except Exception:
-            pass
-        return "Not set"
-
     voice_drop_text = ft.Text(
         f"Voice: {get_voice_display_name()}",
         size=12,
         weight=ft.FontWeight.BOLD,
         text_align=ft.TextAlign.CENTER
     )
+
+    # Shared drag-and-drop handler
+    handle_drop = create_voice_drop_handler(voice_drop_text, page)
 
     # Set up drag target
     def handle_drag_enter(e):
@@ -1900,7 +2332,8 @@ def main(page: ft.Page):
         label="LLM Model", 
         options=ollama_opts, 
         value=default_ollama,
-        on_change=_on_model_changed
+        on_change=_on_model_changed,
+        width=260
     )
     summarize_button = ft.ElevatedButton("Summarize", on_click=lambda e: threading.Thread(target=summarize_text_ui, args=(ollama_dropdown.value, result_text, page), daemon=True).start())
     bullets_button = ft.ElevatedButton("Bullet Points", on_click=lambda e: threading.Thread(target=run_bullet_points_ui, args=(ollama_dropdown.value, result_text, page), daemon=True).start())
@@ -1908,7 +2341,7 @@ def main(page: ft.Page):
     refresh_button = ft.ElevatedButton("⟳", on_click=lambda e: (ollama_dropdown.options.clear(), [ollama_dropdown.options.append(ft.dropdown.Option(m)) for m in get_llm_models()], page.update()))
 
     # Add Ollama command input and Run/Clear buttons
-    command_field = ft.TextField(label="Ollama Command", expand=True)
+    command_field = ft.TextField(label="", expand=True)
     
     # Text destination toggle button
     text_dest_toggle = ft.ElevatedButton("Text → Live", on_click=None)  # Will be set below
@@ -1930,7 +2363,7 @@ def main(page: ft.Page):
     # Initialize overlay state properly
     overlay_enabled = False  # Start with overlay disabled
     overlay_toggle = ft.ElevatedButton(
-        "Overlay: OFF",
+        "Overlay",
         tooltip="Toggle closed captioning overlay"
     )
     
@@ -1939,13 +2372,13 @@ def main(page: ft.Page):
         nonlocal overlay_enabled
         overlay_enabled = not overlay_enabled
         if overlay_enabled:
-            overlay_toggle.text = "Overlay: ON"
+            overlay_toggle.text = "Overlay"
             overlay_toggle.bgcolor = ft.Colors.GREEN_400
             # Show overlay immediately when enabled
             overlay.show()
             print("Overlay enabled")
         else:
-            overlay_toggle.text = "Overlay: OFF"
+            overlay_toggle.text = "Overlay"
             overlay_toggle.bgcolor = None
             # Hide overlay immediately when disabled
             overlay.hide()
@@ -1953,7 +2386,7 @@ def main(page: ft.Page):
             print("Overlay disabled")
         page.update()
     # Auto-TTS toggle button and state
-    auto_tts_toggle = ft.ElevatedButton("Auto-TTS: OFF", on_click=None)
+    auto_tts_toggle = ft.ElevatedButton("Auto-TTS", on_click=None)
     global auto_tts_active, last_processed_text
     auto_tts_active = False
     last_processed_text = ""
@@ -2026,7 +2459,7 @@ def main(page: ft.Page):
         global auto_tts_active
         auto_tts_active = not auto_tts_active
         if auto_tts_active:
-            auto_tts_toggle.text = "Auto-TTS: ON"
+            auto_tts_toggle.text = "Auto-TTS"
             auto_tts_toggle.bgcolor = ft.Colors.BLUE_400
             # If there's text when enabling auto-tts, read it
             if result_text.value.strip():
@@ -2036,7 +2469,7 @@ def main(page: ft.Page):
                     daemon=True
                 ).start()
         else:
-            auto_tts_toggle.text = "Auto-TTS: OFF"
+            auto_tts_toggle.text = "Auto-TTS"
             auto_tts_toggle.bgcolor = None
         page.update()
         print(f"Auto-TTS: {'ON' if auto_tts_active else 'OFF'}")
@@ -2130,8 +2563,14 @@ def main(page: ft.Page):
     overlay_toggle.on_click = _toggle_overlay
     auto_tts_toggle.on_click = _toggle_auto_tts
     
+    def clear_all_fields(e):
+        """Clear both command field and transcription text box"""
+        command_field.value = ""
+        result_text.value = ""
+        page.update()
+
     run_command_button = ft.ElevatedButton("Run", on_click=lambda e: threading.Thread(target=_run_llm_command_thread, daemon=True).start())
-    clear_command_button = ft.ElevatedButton("Clear", on_click=lambda e: (command_field.update(value=""), page.update()))
+    clear_command_button = ft.ElevatedButton("Clear", on_click=clear_all_fields)
 
     # TTS controls
     voices = list_available_voices()
@@ -2151,8 +2590,9 @@ def main(page: ft.Page):
         "TTS: Kokoro",
         tooltip="Toggle between Kokoro and OpenAI TTS",
         on_click=toggle_tts_engine,
-        width=150
+        width=100
     )
+    # Auto-translate functionality removed - UI controls omitted
     
     # Play TTS button
     play_tts_button = ft.IconButton(
@@ -2181,25 +2621,6 @@ def main(page: ft.Page):
         ]
     )
     # Voice file drop target
-    def handle_drop(e: ft.DragTargetEvent):
-        if e.data and 'files' in e.data:
-            files = e.data['files']
-            if files:
-                file_path = files[0]['path']
-                if file_path.lower().endswith(('.wav', '.mp3', '.ogg', '.flac')):
-                    success, result = update_voice_path(file_path)
-                    if success:
-                        voice_drop_text.value = f"Voice: {result}"  # result is already the original filename
-                        voice_drop_text.color = ft.Colors.GREEN
-                    else:
-                        voice_drop_text.value = f"Error: {result}"
-                        voice_drop_text.color = ft.Colors.RED
-                    page.update()
-                    return
-        voice_drop_text.value = "CLONE"
-        voice_drop_text.color = None
-        page.update()
-
     voice_drop = ft.ElevatedButton(
         "CLONE",
         icon=ft.Icons.UPLOAD_FILE,
@@ -2215,23 +2636,15 @@ def main(page: ft.Page):
         data=None,
     )
 
-    # Function to get the current voice display name
-    def get_voice_display_name():
-        try:
-            voice_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'voices', 'current_voice.txt')
-            if os.path.exists(voice_file):
-                with open(voice_file, 'r') as f:
-                    return f.read().strip()
-        except Exception:
-            pass
-        return "Not set"
-
     voice_drop_text = ft.Text(
         f"Voice: {get_voice_display_name()}",
         size=10,
         weight=ft.FontWeight.BOLD,
         text_align=ft.TextAlign.CENTER
     )
+
+    # Shared drag-and-drop handler
+    handle_drop = create_voice_drop_handler(voice_drop_text, page)
 
     # Set up drag target
     def handle_drag_enter(e):
@@ -2272,7 +2685,8 @@ def main(page: ft.Page):
         label="Voice", 
         options=[ft.dropdown.Option(v) for v in voices], 
         value=voices[0],
-        expand=1
+        expand=1,
+        width=200
     )
     speed_slider = ft.Slider(
         min=1, 
@@ -2291,6 +2705,53 @@ def main(page: ft.Page):
         ).start()
     )
     copy_button = ft.ElevatedButton("Copy Text", on_click=lambda e: copy_text_ui(result_text))
+    
+    def save_text_ui(text_field):
+        """Save the text content to the output folder"""
+        text = text_field.value or ""
+        if not text.strip():
+            print("No text to save")
+            return
+        
+        try:
+            # Create output directory if it doesn't exist
+            output_dir = os.path.join(SCRIPT_DIR, 'output')
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Generate filename with timestamp
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            filename = f"text_{timestamp}.txt"
+            filepath = os.path.join(output_dir, filename)
+            
+            # Save text to file
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(text)
+            
+            print(f"Text saved to: {filepath}")
+            
+            # Show success notification
+            page.snack_bar = ft.SnackBar(
+                content=ft.Text(f"Text saved to {filename}"),
+                action="OK",
+                action_color=ft.Colors.WHITE,
+                bgcolor=ft.Colors.GREEN_400,
+            )
+            page.snack_bar.open = True
+            page.update()
+            
+        except Exception as e:
+            print(f"Error saving text: {e}")
+            # Show error notification
+            page.snack_bar = ft.SnackBar(
+                content=ft.Text(f"Error saving text: {str(e)}"),
+                action="OK",
+                action_color=ft.Colors.WHITE,
+                bgcolor=ft.Colors.RED_400,
+            )
+            page.snack_bar.open = True
+            page.update()
+    
+    save_text_button = ft.ElevatedButton("Save Text", on_click=lambda e: save_text_ui(result_text))
     
     # Add click handler to voice drop container to open file picker
     voice_drop.on_click = lambda e: file_picker.pick_files(
@@ -2352,6 +2813,13 @@ def main(page: ft.Page):
             auto_translate_active = not auto_translate_active
             
             if auto_translate_active:
+                # Clear any pending translations in the queue to avoid processing old text
+                while not translation_queue.empty():
+                    try:
+                        translation_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                
                 # Start translation worker if not already running
                 if translate_worker_thread is None or not translate_worker_thread.is_alive():
                     translate_worker_thread = threading.Thread(
@@ -2373,7 +2841,7 @@ def main(page: ft.Page):
                     overlay.update_text("", is_live_transcription=False)
                 # Restore the original transcription if available
                 if buffer.strip():
-                    text_field.value = textwrap.fill(buffer.strip(), width=80)
+                    text_field.value = buffer.strip()
                     page.update()
                 print("Auto-translate DISABLED")
             
@@ -2399,6 +2867,24 @@ def main(page: ft.Page):
             if ollama_dropdown.value.startswith('lmstudio::'):
                 model = ollama_dropdown.value[len('lmstudio::'):]
                 url = 'http://localhost:1234/v1/chat/completions'
+                headers = {'Content-Type': 'application/json'}
+                payload = {
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": f"You are a translator. Translate text to {target_language}. EXTREMELY IMPORTANT you only output the translation, nothing else!!!! If you cant translate output - instead."},
+                        {"role": "user", "content": original_text}
+                    ],
+                    "temperature": 0.3,
+                    "max_tokens": 2000
+                }
+                r = requests.post(url, json=payload, headers=headers, timeout=30)
+                r.raise_for_status()
+                data = r.json()
+                translated = data['choices'][0]['message']['content'].strip()
+            elif ollama_dropdown.value.startswith('llamacpp::'):
+                model = ollama_dropdown.value[len('llamacpp::'):]
+                port = get_llama_cpp_port()
+                url = f'http://localhost:{port}/v1/chat/completions'
                 headers = {'Content-Type': 'application/json'}
                 payload = {
                     "model": model,
@@ -2624,21 +3110,59 @@ def main(page: ft.Page):
     record_llm_button.on_click = start_stream_for_ollama
     
     # Add Alt+Space hotkey functionality
+
+    def _alt_space_play_stop_hotkey():
+        """Handle Alt+Space hotkey to toggle TTS play/stop (not recording)
+
+        This function lives inside main so it can read UI controls like
+        result_text, voice_dropdown and speed_slider from the enclosing scope.
+        """
+        # If TTS is playing (event cleared) -> stop it
+        try:
+            if not tts_stop_event.is_set():
+                stop_tts_ui()
+                return
+        except Exception:
+            # If tts_stop_event isn't available for some reason, fall through
+            pass
+
+        # Otherwise, attempt to play TTS using current UI settings from main
+        try:
+            text = (result_text.value if result_text is not None else "")
+            voice = (voice_dropdown.value if voice_dropdown is not None else None)
+            speed = (speed_slider.value if 'speed_slider' in globals() and speed_slider is not None else 1.0)
+            # device_str and page_ref are module/global variables used elsewhere
+            if text and text.strip() and voice:
+                try:
+                    play_tts_ui(voice, text, device_str, speed, page=page_ref)
+                except Exception as e:
+                    print(f"Error playing TTS from Alt+Space: {e}")
+            else:
+                print("No text or voice selected for TTS play/stop hotkey.")
+        except Exception as e:
+            print(f"Alt+Space play/stop handler failed: {e}")
+
+    # Register Alt+Space for play/stop, keep Alt+Z for recording
+    # Define the recording toggle hotkey handler (preserve original behavior)
     def _alt_space_hotkey():
-        """Handle Alt+Space hotkey to toggle recording"""
+        """Handle Alt+Z hotkey to toggle recording"""
         if start_button.disabled:
             # Currently recording, stop it
             stop_stream(None)
         else:
             # Not recording, start it
             start_stream(None)
-    
-    # Register Alt+Z hotkey
+
+    try:
+        keyboard.add_hotkey('alt+space', _alt_space_play_stop_hotkey, suppress=False)
+        print("Alt+Space hotkey registered for TTS play/stop toggle")
+    except Exception as e:
+        print(f"Failed to register Alt+Space hotkey: {e}")
     try:
         keyboard.add_hotkey('alt+z', _alt_space_hotkey, suppress=False)
         print("Alt+Z hotkey registered for recording toggle")
     except Exception as e:
-        print(f"Failed to register Alt+Space hotkey: {e}")
+        print(f"Failed to register Alt+Z hotkey: {e}")
     
     # Create overlay window immediately
     try:
@@ -2725,16 +3249,19 @@ def main(page: ft.Page):
             now = time.time()
             status = "No input" if (now - t) > 1.0 else "Receiving"
             mic_status.value = f"Mic: {status}"
-            # map RMS to progress bar (tweak scale as needed)
-            level_bar.value = min(1.0, lvl / 0.1)
+            # Update waveform with scaled audio level - make it more sensitive
+            scaled_level = min(1.0, lvl / 0.02)  # More sensitive scaling (was 0.1)
+            waveform_viz.set_level(scaled_level)
+            waveform_viz.update_wave()
             try:
                 page.update()
-                # Update tkinter overlay if it exists
-                if overlay.root is not None:
-                    overlay.root.update()
+                # Avoid calling tkinter's `update()` from a background thread —
+                # invoking `update()` remotely can block or freeze the Tk event loop.
+                # The overlay has its own Tk mainloop and uses `after()` to schedule
+                # updates; do not call `overlay.root.update()` here.
             except Exception:
                 pass
-            time.sleep(0.2)
+            time.sleep(0.05)  # Faster updates for smooth animation (was 0.2)
 
     # Start the UI refresher in a separate thread
     threading.Thread(target=ui_refresher, daemon=True).start()
@@ -2762,24 +3289,24 @@ def main(page: ft.Page):
                     stop_button,
                     audio_source_toggle,
                     overlay_toggle,
-                    mic_status,
-                    level_bar
-                ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                    waveform_control
+                ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.START),
                 
                 # TTS Controls - Row 2
                 ft.Row([
                     tts_engine_btn,
                     play_tts_button,
                     stop_tts_button,
-                    voice_dropdown,
-                    ft.Column([
-                        voice_drop,
-                        voice_drop_text
-                    ], width=120, spacing=0, tight=True, alignment=ft.MainAxisAlignment.CENTER),
-                    speed_slider,
                     auto_tts_toggle,
                     download_tts_button,
+                    save_text_button,
                     copy_button,
+                    ft.Column([
+                        voice_drop_text,
+                        voice_drop
+                    ], width=120, spacing=0, tight=True, alignment=ft.MainAxisAlignment.CENTER),
+                    voice_dropdown,
+                    speed_slider,
                 ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 
                 # Translation and LLM Controls - Row 3
@@ -2788,7 +3315,7 @@ def main(page: ft.Page):
                     language_dropdown,
                     # ID Toggle (Multilingual Mode)
                     ft.Row([
-                        ft.Text("ID:", size=12, color=ft.Colors.WHITE, weight=ft.FontWeight.BOLD),
+                        #ft.Text("ID:", size=12, color=ft.Colors.WHITE, weight=ft.FontWeight.BOLD),
                         ft.Switch(
                             value=False,
                             active_color=ft.Colors.BLUE_200,
@@ -2797,14 +3324,14 @@ def main(page: ft.Page):
                             scale=0.8,
                             on_change=lambda e: setattr(page, 'multilingual_mode', e.control.value)
                         )
-                    ], spacing=5, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                    ], spacing=1, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                     # LLM controls
-                    ft.Container(width=10),  # Spacer
-                    ollama_dropdown,
-                    refresh_button,
+                    ft.Container(width=5),  # Spacer
                     summarize_button,
                     bullets_button,
                     proof_button,
+                    ollama_dropdown,
+                    refresh_button,
                 ], spacing=5, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 
                 # Command input area - Row 4
@@ -2866,4 +3393,4 @@ def main(page: ft.Page):
 
 
 if __name__ == "__main__":
-    ft.app(target=main)
+    ft.app(target=main, assets_dir="icons")
