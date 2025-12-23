@@ -1,15 +1,18 @@
 # Ottertory  
 
-Ottertory provides a **GUI** for handling transcription outputs with a **pop-out live caption box** (adjustable opacity).  
+Captions on any screen transcribing many popular languages, get realtime translation, multilingual text-to-speech capable. This flet app allows users to connect local large language models to query, summarize, generate tutoring session, by typing or speaking commands to apply on the Live transcription box. 
+
+Using OpenAi TTS endpoint or kokoro, you can control how much memory the program requires. With the transcription model Kyutai and a small light LLM like Granite4-micro with 4k context you can slide just under 8gb, allowing realtime translations. If you add the recommended TTS-Webui openai-tts server and use the Chatterbox model, you can have multilingual realtime with under 16gb. 
+
 It can output transcriptions in real time from your **microphone** (default recording device) or from **VB-Cable Output** (virtual audio output device).
 
-Outputs can be copied, Kokoro TTS can read it out loud, Ollama/LMstudio can summarize or perform any custom command on the text (eg. translate). Recording usually goes in the live transcription box but you can change it to type in the Ollama Custom Command box. 
+Outputs can be copied, saved, or have the audio downloaded.
 
-The shortcut to toggle record is **Alt+Z**. Highly recommend having "system volume sounds" at like 10% in Windows volume mixer. Depending on program you'll switch between holding z first and tapping alt or the reverse. 
+The shortcut to toggle record is **Alt+Z** and Play/Stop is **Alt+Space**. Highly recommend having "system volume sounds" at like 10% in Windows volume mixer. Depending on program you'll switch between holding z first and tapping alt or the reverse. 
 
 
 > For best accuracy, I still recommend my other app [Antistentorian](https://github.com/pointave/Antistentorian), which uses **Whisper** or **Parakeet**.  
-> However, the **Kyutai Moshi** model is very responsive and accurate but uses 4gb of VRAM. It works surprisingly well with a ton of languages; French, Portugese, Spanish, Russian, German, Arabic.... others pop up but cant verify.  Similar to how VibeVoice (probably coming soon) said there model was trained for two languages but ends up handeling dozens of them. For chinese you'll need to fix the caption box to show the bottom line, gets some of the characters and might be worth it but I have no idea.
+> 
 ---
 
 ## Installation  
@@ -30,7 +33,7 @@ The shortcut to toggle record is **Alt+Z**. Highly recommend having "system volu
 
 ---
 
-## (Optional) System Audio Capture with VB-Cable
+## (Optional) System Audio Capture with VB-Cable (useful for live captions)
 
 If you want to record system audio in addition to microphone input:
 
@@ -45,7 +48,7 @@ If you want to record system audio in addition to microphone input:
 ---
 ## Openai-TTS Endpoint
 
-Will expand use way later, but I use https://github.com/rsxdalv/TTS-WebUI, specifically there is an option on the tools page called "OpenAI TTS API" and I have the auto enable checked. You are going to want to install that extension, the chatterbox, and probably even the kokoro extension to be safe. HOPEFULLY thats all you need, just have it running at the same time and it will receive requests, but I've only tested on my device.
+I use https://github.com/rsxdalv/TTS-WebUI, specifically there is an option on the tools page called "OpenAI TTS API" and I have the auto enable checked. You are going to want to install the chatterbox extension as well. I made a python file to specifically only open the endpoint and it boots in like 5 seconds.
 
 ***YOU NEED TO CHANGE .env.example to .env*** 
 
@@ -70,6 +73,16 @@ GLHF
 
 
 ---
+## Captions
+The new settings menu is accessible by right clicking on the captions. I recommend reccording someone speaking when wanting to deep dive into it because it gets hidden at the same time the speaker stops talking. In the settings you can change
+
+* Host and Port
+* Model Name
+* Voice
+* Parameters like speed
+
+I tested with a few APIs like vibevoice and a few chatterbox endpoints, and TTS-Webui was the best. To get those working you'll have to change everytime you restart ottertory. You'll have to try combos of model name and voice. Like for example devnen/Chatterbox-TTS-Server I changed its yaml to set ottertory as the reference audio and set voice in settings to tempclone.wav so I could change inside the speaker in the GUI. Turbo model didnt real seem like it saved that much vram but is pretty cool with the [Laugh] [Clears throat] expressions. Vibevoice was still too slow, there is probably a better way of implementing it though like as you are adding live transcriptions.
+
 
 ## Status
 
@@ -84,6 +97,24 @@ GLHF
 Kokoro
 Chatterbox
 Kyutai
+
+@misc{chatterboxtts2025,
+  author       = {{Resemble AI}},
+  title        = {{Chatterbox-TTS}},
+  year         = {2025},
+  howpublished = {\url{https://github.com/resemble-ai/chatterbox}},
+  note         = {GitHub repository}
+}
+
+@techreport{kyutai2025streaming,
+      title={Streaming Sequence-to-Sequence Learning with Delayed Streams Modeling}, 
+      author={Neil Zeghidour and Eugene Kharitonov and Manu Orsini and Václav Volhejn and Gabriel de Marmiesse and Edouard Grave and Patrick Pérez and Laurent Mazaré and Alexandre Défossez},
+      year={2025},
+      eprint={2509.08753},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2509.08753}, 
+}
 
 ---
 
