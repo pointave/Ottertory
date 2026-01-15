@@ -540,14 +540,16 @@ def transcriber_loop(result_field: ft.TextField, page: ft.Page, run_id: int, tex
         
         if should_update and run_id == current_run_id:
             if text_to_command_mode and command_field is not None:
-                command_field.value = buffer.strip()
+                fixed = overlay._fix_character_encoding(buffer.strip()) if overlay else buffer.strip()
+                command_field.value = fixed
                 page.update()
                 if show_overlay:
-                    overlay.update_text(buffer.strip(), is_live_transcription=False)
+                    overlay.update_text(fixed, is_live_transcription=False)
             else:
                 # Only update the result field if auto-translate is not active
                 if not auto_translate_active:
-                    result_field.value = buffer.strip()
+                    fixed = overlay._fix_character_encoding(buffer.strip()) if overlay else buffer.strip()
+                    result_field.value = fixed
                     page.update()
                 
                 # Always update the overlay if shown, but mark as translation when auto-translate is active
@@ -556,7 +558,8 @@ def transcriber_loop(result_field: ft.TextField, page: ft.Page, run_id: int, tex
                         # Don't update the overlay with live text when translating
                         pass
                     else:
-                        overlay.update_text(buffer.strip(), is_live_transcription=True)
+                        fixed_live = overlay._fix_character_encoding(buffer.strip()) if overlay else buffer.strip()
+                        overlay.update_text(fixed_live, is_live_transcription=True)
             
             last_update_time = current_time
             return True
@@ -1201,8 +1204,11 @@ def play_tts_ui(voice_name, text, device_str, speed=1.0, page=None, language_cod
                     if os.path.exists(default_voice):
                         voice_to_use = default_voice
                     else:
-                        print("OpenAI TTS voice file not found; falling back to Kokoro")
-                        return _play_kokoro_tts(voice_name, text, 'cpu', speed)
+                        # If OpenAI TTS is selected but no voice file is available,
+                        # do not fall back to Kokoro automatically. Stay in OpenAI lane
+                        # and abort playback so the user can fix their OpenAI TTS setup.
+                        print("OpenAI TTS voice file not found; aborting TTS (no fallback to Kokoro)")
+                        return
             else:
                 voice_to_use = voice_name
 
@@ -1261,8 +1267,11 @@ def _play_openai_tts(voice_name, text, speed=1.0, language_code=None, multilingu
                 voice_path = last_try
                 print(f"Found voice file at: {voice_path}")
             else:
-                print("Falling back to Kokoro TTS")
-                return _play_kokoro_tts(voice_name, text, 'cpu', speed)
+                # Do NOT fall back to Kokoro here. If the user selected OpenAI TTS
+                # but the voice resource is missing or the server is unreachable,
+                # abort playback and notify via logs so the UI/state remains explicit.
+                print("OpenAI TTS voice file not found; aborting TTS (no fallback to Kokoro)")
+                return
     
     # At this point, voice_path should be a valid absolute path
     voice_id = voice_path
@@ -2498,32 +2507,27 @@ def main(page: ft.Page):
                 if hasattr(page, 'multilingual_mode') and page.multilingual_mode and language_dropdown.value:
                     print("Auto-translating text before TTS...")
                     try:
-                        from ollama import chat
                         target_language = language_dropdown.value
                         print(f"Translating to {target_language}...")
-                        response = chat(
-                            model=ollama_dropdown.value,
-                            messages=[
-                                {"role": "system", "content": f"You are a translator. Translate the following text to {target_language}. Only output the translation, nothing else."},
-                                {"role": "user", "content": full_text}
-                            ],
-                            options={"temperature": 0.3}
-                        )
-                        translated_text = response['message']['content'].strip()
-                        print(f"Translated text: {translated_text[:50]}...")
-                        
-                        # Update the result field with the full translated text
-                        result_text.value = f"{full_text}\n\n--- TRANSLATION ---\n{translated_text}"
-                        page.update()
-                        
-                        # Use translated text for TTS
-                        t = threading.Thread(
-                            target=_play_tts,
-                            args=(translated_text,),
-                            daemon=True
-                        )
-                        t.start()
-                        return  # Exit early since we've handled the TTS with translation
+                        # Use the translate_segment helper which supports Ollama, LM Studio and llama.cpp
+                        translated_text = translate_segment(full_text, target_language, ollama_dropdown.value)
+
+                        if translated_text and translated_text.strip() != "-":
+                            print(f"Translated text: {translated_text[:50]}...")
+                            # Update the result field with the full translated text
+                            result_text.value = f"{full_text}\n\n--- TRANSLATION ---\n{translated_text}"
+                            page.update()
+
+                            # Use translated text for TTS
+                            t = threading.Thread(
+                                target=_play_tts,
+                                args=(translated_text,),
+                                daemon=True
+                            )
+                            t.start()
+                            return  # Exit early since we've handled the TTS with translation
+                        else:
+                            print("Translation failed or returned empty; falling back to non-translated TTS")
                     except Exception as e:
                         print(f"Error in auto-translation: {e}")
                         # Fall back to non-translated TTS
