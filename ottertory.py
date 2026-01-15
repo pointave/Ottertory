@@ -683,7 +683,7 @@ def get_llama_cpp_port():
                     return int(port)
     except Exception:
         pass
-    return 8081  # Default port for llama.cpp
+    return 8080  # Default port for llama.cpp
 
 
 def set_llama_cpp_port(port):
@@ -712,7 +712,7 @@ def get_llm_models():
     # Get Ollama models
     ollama_models = []
     try:
-        resp = requests.get('http://localhost:11434/api/tags', timeout=0.5)
+        resp = requests.get('http://localhost:11434/api/tags', timeout=0.05)
         if resp.status_code == 200:
             data = resp.json()
             if 'models' in data:
@@ -723,7 +723,7 @@ def get_llm_models():
     # Get LM Studio models
     lmstudio_models = []
     try:
-        resp = requests.get('http://localhost:1234/v1/models', timeout=0.5)
+        resp = requests.get('http://localhost:1234/v1/models', timeout=0.05)
         if resp.status_code == 200:
             data = resp.json()
             if 'data' in data:
@@ -740,7 +740,7 @@ def get_llm_models():
     llamacpp_models = []
     llamacpp_port = get_llama_cpp_port()
     try:
-        resp = requests.get(f'http://localhost:{llamacpp_port}/v1/models', timeout=0.5)
+        resp = requests.get(f'http://localhost:{llamacpp_port}/v1/models', timeout=0.05)
         if resp.status_code == 200:
             data = resp.json()
             if 'data' in data:
@@ -758,7 +758,7 @@ def get_llm_models():
     
     # If no models found, provide a default
     if not models and not ollama_models and not lmstudio_models and not llamacpp_models:
-        models = ['granite4:micro-h']  # Default fallback
+        models = ['granite4:micro']  # Default fallback
     
     return models
 
@@ -802,7 +802,7 @@ def call_llm_custom_command(selected, text, command):
                 {"role": "user", "content": f"Process the following text as per the instruction below.\n\nText:\n{text}\n\nInstruction:\n{command}"}
             ]
         }
-        r = requests.post(url, json=payload, headers=headers, timeout=20)
+        r = requests.post(url, json=payload, headers=headers, timeout=10)
         r.raise_for_status()
         data = r.json()
         return data['choices'][0]['message']['content']
